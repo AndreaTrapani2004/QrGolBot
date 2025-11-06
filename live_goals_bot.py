@@ -11,9 +11,11 @@ from datetime import datetime, timedelta
 from telegram import Bot
 
 # ---------- CONFIGURAZIONE ----------
-API_KEY = "6a678756da8c120c03e539d3b0ba62a5"        # Inserisci qui la tua API-Football key
-TELEGRAM_TOKEN = "8529606536:AAEMv4BQPEvnvHE0xubu6QSm2587q0_qtUE"  # Inserisci qui il token del bot
-CHAT_ID = -1002523452868          # Inserisci qui il chat_id del canale
+import os
+
+API_KEY = os.getenv("API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = int(os.getenv("CHAT_ID"))       # Inserisci qui il chat_id del canale
 POLL_INTERVAL = 300               # 5 minuti = 300 secondi
 
 # Base URL API-Football
