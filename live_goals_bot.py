@@ -391,15 +391,23 @@ if __name__ == "__main__":
 
         def cmd_help(update, context):  # type: ignore[unused-argument]
             update.effective_message.reply_text(
+                "QrGolBot – Notifiche 1-1 live\n\n"
+                "Cosa fa: monitora in tempo reale tutte le partite (API-Football) "
+                "e invia un messaggio quando il punteggio diventa 1-1 con questi criteri: "
+                "stessa metà (1H), due gol di squadre opposte entro 10 minuti. "
+                "Il bot esegue controlli periodici e rispetta una quota giornaliera di chiamate API.\n\n"
+                "Variabili richieste: TELEGRAM_TOKEN, API_KEY, CHAT_ID. \n"
+                "Su Render, il bot espone anche una porta HTTP per rimanere attivo in free tier.\n\n"
                 "Comandi disponibili:\n"
-                "/ping - verifica se il bot è attivo\n"
-                "/status - stato ultimo/ prossimo controllo e conteggi odierni\n"
-                "/stats - notifiche per giorno (ultimi 7)\n"
-                "/force_check - esegue subito un controllo\n"
-                "/set_interval <minuti> - imposta intervallo di polling\n"
-                "/quota - mostra quota e intervallo minimo\n"
-                "/set_quota <max_24h> [stima_per_check] - configura quota\n"
-                "/see_all_request - ultime richieste API e notifiche"
+                "/ping – verifica se il bot è attivo\n"
+                "/help – questa guida dettagliata\n"
+                "/status – mostra intervallo attuale, ultimo/prossimo check, errori e notifiche di oggi\n"
+                "/stats – notifiche per giorno (ultimi 7)\n"
+                "/force_check – esegue subito un controllo senza attendere l'intervallo\n"
+                "/set_interval <minuti> – imposta l'intervallo di polling (rispetta il minimo imposto dalla quota)\n"
+                "/quota – mostra quota massima 24h, stima chiamate per check, intervallo minimo e chiamate recenti\n"
+                "/set_quota <max_24h> [stima_per_check] – aggiorna la quota e ricalcola l'intervallo minimo\n"
+                "/see_all_request – mostra ultime richieste API e ultime notifiche inviate"
             )
 
         dp.add_handler(CommandHandler("status", cmd_status))
@@ -448,7 +456,7 @@ if __name__ == "__main__":
 
         # In PTB 13.x non esiste ChannelPostHandler: usa MessageHandler con filtro channel_posts
         dp.add_handler(MessageHandler(Filters.update.channel_posts, handle_channel_command))
-        updater.start_polling(clean=True)
+        updater.start_polling(drop_pending_updates=True)
         print("Updater Telegram avviato per comandi (/see_all_request)")
     except Exception as e:
         print("Updater non avviato:", e)
