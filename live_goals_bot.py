@@ -9,7 +9,7 @@ import time
 import json
 from datetime import datetime, timedelta
 from telegram import Bot
-from telegram.ext import Updater, CommandHandler
+from telegram.ext import Updater, CommandHandler, ChannelPostHandler
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -311,6 +311,39 @@ if __name__ == "__main__":
         dp.add_handler(CommandHandler("force_check", cmd_force_check))
         dp.add_handler(CommandHandler("set_interval", cmd_set_interval, pass_args=True))
         dp.add_handler(CommandHandler("help", cmd_help))
+
+        # Gestione comandi anche nei CANALI (channel_post). Nei canali i comandi arrivano come channel_post.
+        def handle_channel_command(update, context):  # type: ignore[unused-argument]
+            post = getattr(update, "channel_post", None)
+            if not post:
+                return
+            text = post.text or post.caption or ""
+            if not text.startswith("/"):
+                return
+            parts = text.split()
+            raw_cmd = parts[0]
+            # rimuove eventuale @botusername
+            cmd = raw_cmd.split("@")[0].lstrip("/")
+            args = parts[1:]
+
+            # Mappa ai callback già definiti
+            if cmd == "ping":
+                post.reply_text("pong")
+            elif cmd == "see_all_request":
+                cmd_see_all_request(update, context)
+            elif cmd == "status":
+                cmd_status(update, context)
+            elif cmd == "stats":
+                cmd_stats(update, context)
+            elif cmd == "force_check":
+                cmd_force_check(update, context)
+            elif cmd == "set_interval":
+                context.args = args  # passa args
+                cmd_set_interval(update, context)
+            elif cmd == "help":
+                cmd_help(update, context)
+
+        dp.add_handler(ChannelPostHandler(handle_channel_command))
         updater.start_polling()
         print("Updater Telegram avviato per comandi (/see_all_request)")
     except Exception as e:
