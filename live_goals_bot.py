@@ -9,6 +9,8 @@ import time
 import json
 from datetime import datetime, timedelta
 from telegram import Bot
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ---------- CONFIGURAZIONE ----------
 import os
@@ -120,4 +122,33 @@ def main():
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    main()
+    # Se è presente la variabile PORT (es. Render Web Service), esponi una porta HTTP
+    port = os.getenv("PORT")
+
+    if port:
+        class HealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # type: ignore[override]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"OK")
+
+            def log_message(self, format, *args):  # noqa: A003 - silence default logging
+                return
+
+        # Avvia il loop di polling in background
+        t = Thread(target=main, daemon=True)
+        t.start()
+
+        # Avvia un piccolo HTTP server per soddisfare Render (porta obbligatoria)
+        server = HTTPServer(("0.0.0.0", int(port)), HealthHandler)
+        try:
+            print(f"HTTP server in ascolto su 0.0.0.0:{port}")
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
+    else:
+        # Ambiente locale / worker: esegui solo il polling
+        main()
