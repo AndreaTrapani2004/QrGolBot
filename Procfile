@@ -1,0 +1,1 @@
+worker: python live_goals_bot.pyheroku create nome-bot
