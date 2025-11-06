@@ -327,6 +327,42 @@ if __name__ == "__main__":
                 lines.append(f"- {k}: {daily_notification_count.get(k, 0)}")
             update.effective_message.reply_text("\n".join(lines))
 
+        def cmd_live(update, context):  # type: ignore[unused-argument]
+            try:
+                fixtures = get_live_fixtures()
+            except Exception as e:
+                update.effective_message.reply_text(f"Errore nel recupero partite live: {e}")
+                return
+
+            total = len(fixtures)
+            if total == 0:
+                update.effective_message.reply_text("Nessuna partita live al momento.")
+                return
+
+            lines = [f"Partite live analizzate: {total}"]
+            shown = 0
+            for f in fixtures:
+                try:
+                    home = f["teams"]["home"]["name"]
+                    away = f["teams"]["away"]["name"]
+                    gh = f["goals"]["home"]
+                    ga = f["goals"]["away"]
+                    league = f["league"]["name"]
+                    country = f["league"].get("country", "")
+                    elapsed = f.get("fixture", {}).get("status", {}).get("elapsed")
+                    minutes = f"{elapsed}'" if elapsed is not None else ""
+                    lines.append(f"- {league} ({country}) — {home} {gh}-{ga} {away} {minutes}")
+                    shown += 1
+                    if shown >= 30:
+                        break
+                except Exception:
+                    continue
+
+            if total > shown:
+                lines.append(f"…e altre {total - shown} partite")
+
+            update.effective_message.reply_text("\n".join(lines)[:4000])
+
         def cmd_quota(update, context):  # type: ignore[unused-argument]
             min_sec = _recompute_min_interval_from_quota()
             update.effective_message.reply_text(
@@ -400,6 +436,7 @@ if __name__ == "__main__":
                 "Su Render, il bot espone anche una porta HTTP per rimanere attivo in free tier.\n\n"
                 "Comandi disponibili:\n"
                 "/ping – verifica se il bot è attivo\n"
+                "/live – elenco partite live analizzate (una chiamata)\n"
                 "/help – questa guida dettagliata\n"
                 "/status – mostra intervallo attuale, ultimo/prossimo check, errori e notifiche di oggi\n"
                 "/stats – notifiche per giorno (ultimi 7)\n"
@@ -413,6 +450,7 @@ if __name__ == "__main__":
         dp.add_handler(CommandHandler("status", cmd_status))
         dp.add_handler(CommandHandler("stats", cmd_stats))
         dp.add_handler(CommandHandler("force_check", cmd_force_check))
+        dp.add_handler(CommandHandler("live", cmd_live))
         dp.add_handler(CommandHandler("set_interval", cmd_set_interval, pass_args=True))
         dp.add_handler(CommandHandler("quota", cmd_quota))
         dp.add_handler(CommandHandler("set_quota", cmd_set_quota, pass_args=True))
@@ -451,6 +489,8 @@ if __name__ == "__main__":
             elif cmd == "set_quota":
                 context.args = args
                 cmd_set_quota(update, context)
+            elif cmd == "live":
+                cmd_live(update, context)
             elif cmd == "help":
                 cmd_help(update, context)
 
