@@ -215,10 +215,10 @@ def process_matches():
         p1 = g1.get("time", {}).get("period")
         p2 = g2.get("time", {}).get("period")
         t1 = "home" if g1.get("team", {}).get("id") == f["teams"]["home"]["id"] else "away"
-        t2 = "home" if g2.get("team", {}).get("team", {}).get("id") == f["teams"]["home"]["id"] else "away"
+        t2 = "home" if g2.get("team", {}).get("id") == f["teams"]["home"]["id"] else "away"
 
-        # Condizioni: stessa metà e differenza <= 10 minuti, squadre opposte
-        if p1 == p2 and t1 != t2 and m1 is not None and m2 is not None and (m2 - m1) <= 10 and p1 == "1H":
+        # Condizioni: stessa metà (1H o 2H) e differenza <= 10 minuti, squadre opposte
+        if p1 == p2 and t1 != t2 and m1 is not None and m2 is not None and (m2 - m1) <= 10 and p1 in ("1H", "2H"):
             first_score = "1-0" if t1 == "home" else "0-1"
             second_score = "1-1"
             send_message(home, away, league, country, first_score, m1, second_score, m2)
