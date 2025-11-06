@@ -283,6 +283,12 @@ if __name__ == "__main__":
     # Configura Updater per comandi Telegram
     updater = None
     try:
+        # Evita conflitti con webhook precedenti o altre sessioni getUpdates
+        try:
+            bot.delete_webhook(drop_pending_updates=True)
+            print("Webhook eliminato e pending updates scartati")
+        except Exception as e:
+            print("Impossibile eliminare webhook:", e)
         updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
         dp = updater.dispatcher
         dp.add_handler(CommandHandler("see_all_request", cmd_see_all_request))
@@ -442,7 +448,7 @@ if __name__ == "__main__":
 
         # In PTB 13.x non esiste ChannelPostHandler: usa MessageHandler con filtro channel_posts
         dp.add_handler(MessageHandler(Filters.update.channel_posts, handle_channel_command))
-        updater.start_polling()
+        updater.start_polling(clean=True)
         print("Updater Telegram avviato per comandi (/see_all_request)")
     except Exception as e:
         print("Updater non avviato:", e)
