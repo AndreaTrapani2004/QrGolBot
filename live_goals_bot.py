@@ -1,533 +1,634 @@
 """
 live_goals_bot.py
 Bot Telegram per notifiche 1-1 live in tutti i campionati
-Chiamate API ogni 5 minuti per risparmiare richieste (piano free API-Football)
+Monitora partite live tramite scraping FlashScore Mobile
+Traccia partite in stato 1-0/0-1 e notifica quando diventano 1-1 entro 10 minuti
 """
 
-import requests
 import time
 import json
+import os
 from datetime import datetime, timedelta
 from telegram import Bot
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from bs4 import BeautifulSoup
 
 # ---------- CONFIGURAZIONE ----------
-import os
-
-API_KEY = os.getenv("API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID"))       # Inserisci qui il chat_id del canale
-POLL_INTERVAL = 600               # 10 minuti = 600 secondi
-# Intervallo modificabile a runtime tramite /set_interval
-poll_interval_seconds = POLL_INTERVAL
-
-# Log in-memory per comandi
-api_call_log = []  # [{time, endpoint, params, ok}]
-notifications_log = []  # [{time, home, away, league, country, first_score, first_min, second_score, second_min}]
-
-# Stato runtime per /status e /stats
-last_check_started_at = None  # ISO string
-last_check_finished_at = None  # ISO string
-last_check_error = None  # Optional str
-
-from collections import defaultdict
-daily_notification_count = defaultdict(int)  # key: YYYY-MM-DD, value: count
-
-import threading
-force_check_lock = threading.Lock()
-force_check_requested = False
-
-# ---------- QUOTA / RATE LIMIT ----------
-# Numero massimo di chiamate API consentite nelle ultime 24 ore (configurabile)
-max_calls_per_day = 100
-# Stima di quante chiamate consuma 1 "check" (fixtures + events, ecc.)
-calls_per_check_estimate = 1
-
-def _utc_now_iso():
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-def _calls_last_24h():
-    if not api_call_log:
-        return 0
-    now = datetime.utcnow()
-    cutoff = now - timedelta(days=1)
-    count = 0
-    for c in api_call_log:
-        try:
-            t = datetime.strptime(c["time"], "%Y-%m-%dT%H:%M:%SZ")
-        except Exception:
-            # fallback: try without Z if needed
-            try:
-                t = datetime.fromisoformat(c["time"].replace("Z", ""))
-            except Exception:
-                continue
-        if t >= cutoff:
-            count += 1
-    return count
-
-def _recompute_min_interval_from_quota():
-    # Intervallo minimo per non sforare la quota, assumendo la stima per check
-    # 86400 sec/giorno * calls_per_check_estimate / max_calls_per_day
-    if max_calls_per_day <= 0 or calls_per_check_estimate <= 0:
-        return 86400  # fallback 24h
-    seconds = int((86400 * calls_per_check_estimate) / max_calls_per_day)
-    return max(1, seconds)
-
-# Base URL API-Football
-BASE_URL = "https://v3.football.api-sports.io"
+CHAT_ID = int(os.getenv("CHAT_ID"))
+POLL_INTERVAL = 300  # 5 minuti = 300 secondi
+FLASHSCORE_URL = "https://m.flashscore.com"
 
 # Bot Telegram
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# File per salvare le partite già notificate
-SENT_FILE = "sent_matches.json"
+# File per salvare le partite attive in tracking
+ACTIVE_MATCHES_FILE = "active_matches.json"
+# File per salvare le partite già notificate (evita duplicati)
+SENT_MATCHES_FILE = "sent_matches.json"
+
 
 # ---------- FUNZIONI UTILI ----------
-def load_sent_matches():
+def load_active_matches():
+    """Carica le partite attive in tracking (1-0/0-1) da file"""
     try:
-        with open(SENT_FILE, "r") as f:
+        with open(ACTIVE_MATCHES_FILE, "r") as f:
+            data = json.load(f)
+            # Converti timestamp string in datetime
+            for match_id, match_data in data.items():
+                match_data["first_goal_time"] = datetime.fromisoformat(match_data["first_goal_time"])
+            return data
+    except Exception:
+        return {}
+
+
+def save_active_matches(active_matches):
+    """Salva le partite attive in tracking su file"""
+    # Converti datetime in string per JSON
+    data = {}
+    for match_id, match_data in active_matches.items():
+        data[match_id] = match_data.copy()
+        data[match_id]["first_goal_time"] = match_data["first_goal_time"].isoformat()
+    
+    with open(ACTIVE_MATCHES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_sent_matches():
+    """Carica le partite già notificate da file"""
+    try:
+        with open(SENT_MATCHES_FILE, "r") as f:
             return set(json.load(f))
     except Exception:
         return set()
 
+
 def save_sent_matches(sent_set):
-    with open(SENT_FILE, "w") as f:
+    """Salva le partite già notificate su file"""
+    with open(SENT_MATCHES_FILE, "w") as f:
         json.dump(list(sent_set), f)
 
-def get_live_fixtures():
-    headers = {"x-apisports-key": API_KEY}
-    params = {"live": "all"}
-    endpoint = f"{BASE_URL}/fixtures"
-    r = requests.get(endpoint, headers=headers, params=params, timeout=15)
-    try:
-        return r.json().get("response", [])
-    finally:
-        api_call_log.append({
-            "time": _utc_now_iso(),
-            "endpoint": endpoint,
-            "params": params,
-            "ok": r.ok,
-        })
 
-def get_fixture_events(fixture_id):
-    headers = {"x-apisports-key": API_KEY}
-    params = {"fixture": fixture_id}
-    endpoint = f"{BASE_URL}/fixtures/events"
-    r = requests.get(endpoint, headers=headers, params=params, timeout=15)
-    try:
-        return r.json().get("response", [])
-    finally:
-        api_call_log.append({
-            "time": _utc_now_iso(),
-            "endpoint": endpoint,
-            "params": params,
-            "ok": r.ok,
-        })
+def get_match_id(home, away, league):
+    """Genera un ID univoco per una partita"""
+    return f"{home}_{away}_{league}".lower().replace(" ", "_")
 
-def parse_minute(ev):
+
+def setup_selenium_driver():
+    """Configura e restituisce un driver Selenium per FlashScore Mobile"""
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")  # Esegui in background
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--user-agent=Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1")
+    
+    # Prova a creare il driver (richiede chromedriver installato)
     try:
-        return int(ev.get("time", {}).get("elapsed"))
-    except:
-        return None
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.set_page_load_timeout(30)
+        return driver
+    except Exception as e:
+        print(f"Errore nella configurazione di Selenium: {e}")
+        print("Assicurati di avere ChromeDriver installato e nel PATH")
+        raise
+
+
+def scrape_flashscore_mobile():
+    """Scraping di FlashScore Mobile per ottenere tutte le partite live"""
+    driver = None
+    try:
+        driver = setup_selenium_driver()
+        
+        # Naviga direttamente alla pagina live
+        print("Navigazione a FlashScore Mobile Live...")
+        driver.get("https://m.flashscore.com/football/live/")
+        
+        # Attendi che la pagina si carichi completamente
+        time.sleep(8)
+        
+        # Prova a scrollare per caricare più contenuti
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+        
+        # Ottieni l'HTML della pagina
+        html = driver.page_source
+        soup = BeautifulSoup(html, "lxml")
+        
+        matches = []
+        
+        # FlashScore Mobile: cerca l'elemento score-data che contiene tutte le partite
+        score_data = soup.find("div", id="score-data")
+        
+        if not score_data:
+            print("Elemento score-data non trovato, uso approccio alternativo...")
+            # Fallback: cerca link a partite
+            match_links = soup.find_all("a", href=lambda x: x and "/match/" in x)
+            print(f"Trovati {len(match_links)} link a partite (fallback)")
+            return matches
+        
+        print("Trovato elemento score-data, estrazione partite...")
+        
+        # Trova tutte le sezioni (ogni h4 definisce una lega)
+        all_h4 = score_data.find_all("h4")
+        
+        # Se non ci sono h4, usa l'intero score-data
+        if not all_h4:
+            all_h4 = [score_data]
+        
+        # Per ogni sezione (lega), estrai le partite
+        for h4_idx, h4 in enumerate(all_h4):
+            # Estrai lega dall'h4
+            league_full = h4.get_text(strip=True) if h4.name == "h4" else "Unknown"
+            # Rimuovi "Standings" e link dalla lega
+            league_full = league_full.split("Standings")[0].strip()
+            # Estrai paese se presente (prima dei ":")
+            country = "Unknown"
+            league = league_full
+            if ":" in league_full:
+                country = league_full.split(":")[0].strip()
+                league = league_full.split(":")[-1].strip()
+            
+            # Trova tutte le partite di questa sezione
+            # Le partite sono tra questo h4 e il prossimo h4 (o fine)
+            if h4_idx < len(all_h4) - 1:
+                # Partite tra questo h4 e il prossimo
+                next_h4 = all_h4[h4_idx + 1]
+                section = score_data.find_all("a", href=lambda x: x and "/match/" in x)
+                # Filtra solo quelle tra h4 e next_h4
+                match_links = []
+                current = h4.next_sibling
+                while current and current != next_h4:
+                    if hasattr(current, "find_all"):
+                        links = current.find_all("a", href=lambda x: x and "/match/" in x)
+                        match_links.extend(links)
+                    current = current.next_sibling
+            else:
+                # Ultima sezione: tutte le partite dopo l'ultimo h4
+                match_links = []
+                current = h4.next_sibling
+                while current:
+                    if hasattr(current, "find_all"):
+                        links = current.find_all("a", href=lambda x: x and "/match/" in x)
+                        match_links.extend(links)
+                    current = current.next_sibling
+            
+            # Se non trova partite con il metodo sopra, usa tutte le partite dopo l'h4
+            if not match_links:
+                # Trova tutti i link dopo questo h4
+                all_links = score_data.find_all("a", href=lambda x: x and "/match/" in x)
+                # Prendi solo quelli che vengono dopo questo h4
+                h4_position = list(score_data.children).index(h4) if h4 in list(score_data.children) else 0
+                match_links = [link for link in all_links if score_data.find_all().index(link) > h4_position] if all_links else []
+            
+            # Se ancora non trova, usa tutte le partite (fallback)
+            if not match_links:
+                match_links = score_data.find_all("a", href=lambda x: x and "/match/" in x)
+            
+            print(f"Sezione {h4_idx + 1}: {league} ({country}) - {len(match_links)} partite")
+            
+            # Per ogni link, estrai le informazioni della partita
+            # Struttura: <span class="live">24'</span>Squadra1 - Squadra2 <a href="/match/..." class="live">1:0</a>
+            for link in match_links:
+                try:
+                    # Estrai punteggio dal link (formato "1:0" o "1-0")
+                    score_text = link.get_text(strip=True)
+                    # Converti ":" in "-" se necessario
+                    if ":" in score_text:
+                        score_text = score_text.replace(":", "-")
+                    
+                    # Verifica che sia un punteggio valido
+                    score_parts = score_text.split("-")
+                    if len(score_parts) != 2 or not score_parts[0].isdigit() or not score_parts[1].isdigit():
+                        continue
+                    
+                    score_home = int(score_parts[0])
+                    score_away = int(score_parts[1])
+                    
+                    # Trova il span con il minuto prima del link
+                    minute = None
+                    prev_sibling = link.find_previous_sibling("span", class_="live")
+                    if prev_sibling:
+                        minute_text = prev_sibling.get_text(strip=True)
+                        # Rimuovi apostrofo se presente
+                        minute_text = minute_text.replace("'", "").replace("'", "")
+                        try:
+                            minute = int(minute_text)
+                        except:
+                            pass
+                    
+                    # Trova il testo con le squadre (tra il span e il link)
+                    # Il testo delle squadre è nel contenitore padre
+                    parent = link.parent
+                    if not parent:
+                        continue
+                    
+                    # Ottieni tutto il testo del parent e rimuovi il punteggio e il minuto
+                    full_text = parent.get_text(strip=True)
+                    # Rimuovi il punteggio dal testo
+                    full_text = full_text.replace(score_text, "").strip()
+                    # Rimuovi il minuto se presente
+                    if minute:
+                        full_text = full_text.replace(f"{minute}'", "").replace(f"{minute}'", "").strip()
+                    
+                    # Estrai squadre (formato "Squadra1 - Squadra2")
+                    if " - " not in full_text:
+                        continue
+                    
+                    parts = full_text.split(" - ")
+                    if len(parts) != 2:
+                        continue
+                    
+                    home = parts[0].strip()
+                    away = parts[1].strip()
+                    
+                    # Rimuovi eventuali caratteri speciali o immagini
+                    home = " ".join(home.split())
+                    away = " ".join(away.split())
+                    
+                    if not home or not away:
+                        continue
+                    
+                    matches.append({
+                        "home": home,
+                        "away": away,
+                        "score_home": score_home,
+                        "score_away": score_away,
+                        "league": league,
+                        "country": country,
+                        "minute": minute
+                    })
+                except Exception as e:
+                    print(f"Errore nell'estrazione partita: {e}")
+                    continue
+        
+        print(f"Estratte {len(matches)} partite valide")
+        return matches
+    
+    except Exception as e:
+        print(f"Errore nello scraping FlashScore: {e}")
+        return []
+    
+    finally:
+        if driver:
+            driver.quit()
+
 
 def send_message(home, away, league, country, first_score, first_min, second_score, second_min):
+    """Invia messaggio Telegram con i dettagli del pattern 1-1"""
+    global total_notifications_sent
+    
     text = f"{home} - {away} ({league} - {country})\n" \
            f"{first_score} ; {first_min}'\n" \
            f"{second_score} ; {second_min}'"
     bot.send_message(chat_id=CHAT_ID, text=text)
-    notifications_log.append({
-        "time": _utc_now_iso(),
-        "home": home,
-        "away": away,
-        "league": league,
-        "country": country,
-        "first_score": first_score,
-        "first_min": first_min,
-        "second_score": second_score,
-        "second_min": second_min,
-    })
-    # Aggiorna contatore giornaliero
-    day_key = datetime.utcnow().strftime("%Y-%m-%d")
-    daily_notification_count[day_key] += 1
+    
+    # Aggiorna statistiche
+    total_notifications_sent += 1
+    today = datetime.now().strftime("%Y-%m-%d")
+    daily_notifications[today] += 1
 
 
-# ---------- COMANDI TELEGRAM ----------
-def cmd_see_all_request(update, context):  # type: ignore[unused-argument]
-    # Mostra gli ultimi elementi per non superare i limiti di Telegram
-    last_calls = api_call_log[-20:]
-    last_notif = notifications_log[-10:]
+def cleanup_expired_matches(active_matches):
+    """Rimuove partite scadute (>10 minuti dal primo gol)"""
+    now = datetime.now()
+    expired = []
+    
+    for match_id, match_data in active_matches.items():
+        first_goal_time = match_data["first_goal_time"]
+        elapsed = (now - first_goal_time).total_seconds() / 60  # minuti
+        
+        if elapsed > 10:
+            expired.append(match_id)
+    
+    for match_id in expired:
+        del active_matches[match_id]
+        print(f"Partita scaduta rimossa dal tracking: {match_id}")
+    
+    return active_matches
 
-    lines = []
-    lines.append("Richieste API (ultime 20):")
-    for c in last_calls:
-        status = "ok" if c.get("ok") else "fail"
-        lines.append(f"- {c['time']} {c['endpoint']} {c['params']} [{status}]")
-
-    lines.append("")
-    lines.append("Notifiche inviate (ultime 10):")
-    for n in last_notif:
-        lines.append(
-            f"- {n['time']} {n['home']} - {n['away']} ({n['league']} - {n['country']}) "
-            f"{n['first_score']} ; {n['first_min']}'  ->  {n['second_score']} ; {n['second_min']}'"
-        )
-
-    text = "\n".join(lines) or "Nessun dato ancora."
-    try:
-        update.effective_message.reply_text(text[:4000])
-    except Exception:
-        # Se supera i limiti, invia un riassunto minimo
-        update.effective_message.reply_text("Troppe righe; riduco l'output. Richieste: " + str(len(last_calls)) + ", Notifiche: " + str(len(last_notif)))
 
 # ---------- LOGICA PRINCIPALE ----------
 def process_matches():
+    """Processa tutte le partite live e gestisce il tracking 1-0/0-1 → 1-1"""
+    active_matches = load_active_matches()
     sent_matches = load_sent_matches()
-    fixtures = get_live_fixtures()
-
-    for f in fixtures:
-        fid = f["fixture"]["id"]
-        home = f["teams"]["home"]["name"]
-        away = f["teams"]["away"]["name"]
-        league = f["league"]["name"]
-        country = f["league"]["country"]
-
-        score_home = f["goals"]["home"]
-        score_away = f["goals"]["away"]
-
-        if score_home != 1 or score_away != 1:
-            continue  # ci interessano solo 1-1
-
-        if fid in sent_matches:
-            continue  # già notificata
-
-        # Recupera eventi per la partita
-        events = get_fixture_events(fid)
-        goal_events = [e for e in events if e.get("type") == "Goal"]
-        if len(goal_events) < 2:
-            continue  # non ci sono 2 gol, skip
-
-        # Prendi gli ultimi due gol
-        g1 = goal_events[-2]
-        g2 = goal_events[-1]
-        m1 = parse_minute(g1)
-        m2 = parse_minute(g2)
-        p1 = g1.get("time", {}).get("period")
-        p2 = g2.get("time", {}).get("period")
-        t1 = "home" if g1.get("team", {}).get("id") == f["teams"]["home"]["id"] else "away"
-        t2 = "home" if g2.get("team", {}).get("id") == f["teams"]["home"]["id"] else "away"
-
-        # Condizioni: stessa metà (1H o 2H) e differenza <= 10 minuti, squadre opposte
-        if p1 == p2 and t1 != t2 and m1 is not None and m2 is not None and (m2 - m1) <= 10 and p1 in ("1H", "2H"):
-            first_score = "1-0" if t1 == "home" else "0-1"
-            second_score = "1-1"
-            send_message(home, away, league, country, first_score, m1, second_score, m2)
-            sent_matches.add(fid)
-
+    
+    # Rimuovi partite scadute (>10 minuti)
+    active_matches = cleanup_expired_matches(active_matches)
+    
+    # Scraping partite live
+    print("Scraping FlashScore Mobile...")
+    live_matches = scrape_flashscore_mobile()
+    print(f"Trovate {len(live_matches)} partite live")
+    
+    now = datetime.now()
+    
+    for match in live_matches:
+        home = match["home"]
+        away = match["away"]
+        score_home = match["score_home"]
+        score_away = match["score_away"]
+        league = match["league"]
+        country = match.get("country", "Unknown")
+        minute = match.get("minute")
+        
+        match_id = get_match_id(home, away, league)
+        
+        # Se la partita è già stata notificata, salta
+        if match_id in sent_matches:
+            continue
+        
+        # CASO 1: Partita in stato 1-0 o 0-1 (non ancora tracciata)
+        if (score_home == 1 and score_away == 0) or (score_home == 0 and score_away == 1):
+            if match_id not in active_matches:
+                # Nuova partita da tracciare
+                first_score = "1-0" if score_home == 1 else "0-1"
+                active_matches[match_id] = {
+                    "home": home,
+                    "away": away,
+                    "league": league,
+                    "country": country,
+                    "first_goal_time": now,
+                    "first_score": first_score,
+                    "first_goal_minute": minute if minute else 0
+                }
+                print(f"Nuova partita tracciata: {home} - {away} ({first_score})")
+        
+        # CASO 2: Partita già tracciata (1-0/0-1) che diventa 1-1
+        elif score_home == 1 and score_away == 1:
+            if match_id in active_matches:
+                # Calcola tempo trascorso dal primo gol
+                match_data = active_matches[match_id]
+                first_goal_time = match_data["first_goal_time"]
+                elapsed_minutes = (now - first_goal_time).total_seconds() / 60
+                
+                # Se è diventata 1-1 entro 10 minuti, invia notifica
+                if elapsed_minutes <= 10:
+                    first_score = match_data["first_score"]
+                    first_min = match_data["first_goal_minute"]
+                    second_min = minute if minute else int(elapsed_minutes)  # Usa minuto corrente o calcolato
+                    
+                    send_message(home, away, league, country, first_score, first_min, "1-1", second_min)
+                    sent_matches.add(match_id)
+                    del active_matches[match_id]
+                    print(f"Notifica inviata: {home} - {away} ({first_score} → 1-1)")
+                else:
+                    # Scaduta, rimuovi dal tracking
+                    del active_matches[match_id]
+                    print(f"Partita scaduta (>{elapsed_minutes:.1f} min): {home} - {away}")
+        
+        # CASO 3: Partita tracciata che non è più 1-0/0-1 e non è 1-1 (es. 2-0, 0-2, ecc.)
+        elif match_id in active_matches:
+            # Rimuovi dal tracking (non è più interessante)
+            del active_matches[match_id]
+            print(f"Partita rimossa dal tracking (punteggio cambiato): {home} - {away}")
+    
+    # Salva stato
+    save_active_matches(active_matches)
     save_sent_matches(sent_matches)
 
 
-def run_check_once():
-    global last_check_started_at, last_check_finished_at, last_check_error
-    last_check_error = None
-    last_check_started_at = _utc_now_iso()
-    # Se la quota è satura nelle ultime 24h, salta il check
+# ---------- STATO RUNTIME PER COMANDI ----------
+from collections import defaultdict
+
+last_check_started_at = None
+last_check_finished_at = None
+last_check_error = None
+total_notifications_sent = 0
+daily_notifications = defaultdict(int)
+
+
+# ---------- COMANDI TELEGRAM ----------
+def cmd_ping(update, context):
+    """Verifica se il bot è attivo"""
+    update.effective_message.reply_text("pong ✅")
+
+
+def cmd_help(update, context):
+    """Mostra guida dettagliata"""
+    help_text = (
+        "⚽ QrGolBot - Notifiche 1-1 Live\n\n"
+        "Cosa fa: Monitora tutte le partite live (FlashScore) e invia notifiche "
+        "quando il punteggio diventa 1-1 con questi criteri:\n"
+        "• Partita era 1-0 o 0-1\n"
+        "• Diventa 1-1 entro 10 minuti dal primo gol\n"
+        "• Stessa metà tempo (1H o 2H)\n"
+        "• Squadre opposte\n\n"
+        "📋 Comandi disponibili:\n"
+        "/ping - Verifica se il bot è attivo\n"
+        "/help - Questa guida\n"
+        "/status - Stato ultimo check, errori, statistiche\n"
+        "/live - Elenco partite live attualmente monitorate\n"
+        "/stats - Statistiche notifiche (ultimi 7 giorni)\n"
+        "/active - Partite attualmente in tracking (1-0/0-1)"
+    )
+    update.effective_message.reply_text(help_text)
+
+
+def cmd_status(update, context):
+    """Mostra stato del bot"""
+    lines = []
+    lines.append("📊 Stato Bot:")
+    lines.append(f"Intervallo controlli: {POLL_INTERVAL // 60} minuti")
+    
+    if last_check_started_at:
+        lines.append(f"Ultimo check start: {last_check_started_at.strftime('%H:%M:%S')}")
+    else:
+        lines.append("Ultimo check start: Nessuno")
+    
+    if last_check_finished_at:
+        lines.append(f"Ultimo check end: {last_check_finished_at.strftime('%H:%M:%S')}")
+        if last_check_started_at:
+            elapsed = (last_check_finished_at - last_check_started_at).total_seconds()
+            lines.append(f"Durata ultimo check: {elapsed:.1f}s")
+    else:
+        lines.append("Ultimo check end: Nessuno")
+    
+    if last_check_error:
+        lines.append(f"⚠️ Ultimo errore: {last_check_error}")
+    else:
+        lines.append("✅ Nessun errore")
+    
+    # Carica partite attive
+    active_matches = load_active_matches()
+    lines.append(f"Partite in tracking: {len(active_matches)}")
+    
+    # Statistiche giornaliere
+    today = datetime.now().strftime("%Y-%m-%d")
+    lines.append(f"Notifiche oggi: {daily_notifications.get(today, 0)}")
+    lines.append(f"Totale notifiche: {total_notifications_sent}")
+    
+    update.effective_message.reply_text("\n".join(lines))
+
+
+def cmd_live(update, context):
+    """Mostra partite live attualmente monitorate"""
     try:
-        recent = _calls_last_24h()
-        if recent >= max_calls_per_day - calls_per_check_estimate:
-            # Salta per non superare la quota
-            last_check_error = "Quota giornaliera quasi raggiunta: check saltato"
+        # Esegui uno scraping veloce
+        matches = scrape_flashscore_mobile()
+        
+        if not matches:
+            update.effective_message.reply_text("Nessuna partita live al momento.")
             return
-    except Exception:
-        pass
-    try:
-        process_matches()
+        
+        # Filtra solo partite 1-0, 0-1, o 1-1
+        relevant = [m for m in matches if 
+                   (m["score_home"] == 1 and m["score_away"] == 0) or
+                   (m["score_home"] == 0 and m["score_away"] == 1) or
+                   (m["score_home"] == 1 and m["score_away"] == 1)]
+        
+        if not relevant:
+            update.effective_message.reply_text(f"Trovate {len(matches)} partite live, nessuna in stato 1-0/0-1/1-1.")
+            return
+        
+        lines = [f"📊 Partite live rilevanti: {len(relevant)}"]
+        for m in relevant[:20]:  # Limita a 20 per non superare limiti Telegram
+            minute = f" {m['minute']}'" if m.get('minute') else ""
+            lines.append(f"• {m['home']} - {m['away']} {m['score_home']}-{m['score_away']}{minute} ({m['league']})")
+        
+        if len(relevant) > 20:
+            lines.append(f"... e altre {len(relevant) - 20} partite")
+        
+        update.effective_message.reply_text("\n".join(lines)[:4000])
     except Exception as e:
-        last_check_error = str(e)
-        raise
-    finally:
-        last_check_finished_at = _utc_now_iso()
+        update.effective_message.reply_text(f"Errore nel recupero partite: {e}")
 
-def main():
-    global poll_interval_seconds
-    while True:
-        try:
-            # Se richiesto un controllo immediato da /force_check
-            global force_check_requested
-            with force_check_lock:
-                do_force = force_check_requested
-                force_check_requested = False
-            if do_force:
-                run_check_once()
-            else:
-                run_check_once()
-        except Exception as e:
-            print("Errore:", e)
-        # Calcola la soglia minima dal quota e applica al poll interval
-        min_from_quota = _recompute_min_interval_from_quota()
-        if poll_interval_seconds < min_from_quota:
-            poll_interval_seconds = min_from_quota
 
-        # Attendi l'intervallo corrente (può essere aggiornato da /set_interval o da quota)
-        sleep_left = poll_interval_seconds
-        # Spezzetta il sleep per poter reagire prima a /force_check
-        step = 1
-        while sleep_left > 0:
-            time.sleep(min(step, sleep_left))
-            sleep_left -= step
-            with force_check_lock:
-                if force_check_requested:
-                    break
+def cmd_active(update, context):
+    """Mostra partite attualmente in tracking (1-0/0-1)"""
+    active_matches = load_active_matches()
+    
+    if not active_matches:
+        update.effective_message.reply_text("Nessuna partita in tracking al momento.")
+        return
+    
+    lines = [f"📋 Partite in tracking: {len(active_matches)}"]
+    now = datetime.now()
+    
+    for match_id, match_data in list(active_matches.items())[:15]:  # Limita a 15
+        first_goal_time = match_data["first_goal_time"]
+        elapsed_minutes = (now - first_goal_time).total_seconds() / 60
+        remaining = max(0, 10 - elapsed_minutes)
+        
+        lines.append(
+            f"• {match_data['home']} - {match_data['away']} "
+            f"({match_data['first_score']}) - "
+            f"{remaining:.1f} min rimanenti"
+        )
+    
+    if len(active_matches) > 15:
+        lines.append(f"... e altre {len(active_matches) - 15} partite")
+    
+    update.effective_message.reply_text("\n".join(lines)[:4000])
 
-if __name__ == "__main__":
-    # Configura Updater per comandi Telegram
-    updater = None
+
+def cmd_stats(update, context):
+    """Mostra statistiche notifiche"""
+    today = datetime.now().date()
+    lines = ["📊 Statistiche notifiche (ultimi 7 giorni):"]
+    
+    total_week = 0
+    for i in range(7):
+        d = today - timedelta(days=i)
+        date_str = d.strftime("%Y-%m-%d")
+        count = daily_notifications.get(date_str, 0)
+        total_week += count
+        day_name = d.strftime("%a %d/%m")
+        lines.append(f"• {day_name}: {count}")
+    
+    lines.append(f"\nTotale settimana: {total_week}")
+    lines.append(f"Totale generale: {total_notifications_sent}")
+    
+    update.effective_message.reply_text("\n".join(lines))
+
+
+def setup_telegram_commands():
+    """Configura e avvia Updater per comandi Telegram"""
     try:
-        # Evita conflitti con webhook precedenti o altre sessioni getUpdates
+        # Elimina webhook se presente
         try:
             bot.delete_webhook(drop_pending_updates=True)
-            print("Webhook eliminato e pending updates scartati")
-        except Exception as e:
-            print("Impossibile eliminare webhook:", e)
+        except:
+            pass
+        
         updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
         dp = updater.dispatcher
-        dp.add_handler(CommandHandler("see_all_request", cmd_see_all_request))
-        # Nuovi comandi
-        dp.add_handler(CommandHandler("ping", lambda u, c: u.effective_message.reply_text("pong")))
-
-        def cmd_status(update, context):  # type: ignore[unused-argument]
-            interval_min = int(poll_interval_seconds // 60)
-            lines = []
-            lines.append(f"Intervallo: {interval_min} min")
-            lines.append(f"Quota max 24h: {max_calls_per_day} (stima/check: {calls_per_check_estimate})")
-            lines.append(f"Chiamate ultime 24h: {_calls_last_24h()}")
-            lines.append(f"Ultimo check start: {last_check_started_at}")
-            lines.append(f"Ultimo check end: {last_check_finished_at}")
-            if last_check_finished_at:
-                try:
-                    end_dt = datetime.strptime(last_check_finished_at, "%Y-%m-%dT%H:%M:%SZ")
-                except Exception:
-                    end_dt = None
-                if end_dt is not None:
-                    next_eta = end_dt + timedelta(seconds=poll_interval_seconds)
-                    lines.append("Prossimo check (stimato UTC): " + next_eta.strftime("%Y-%m-%dT%H:%M:%SZ"))
-            if last_check_error:
-                lines.append("Ultimo errore: " + last_check_error)
-            day_key = datetime.utcnow().strftime("%Y-%m-%d")
-            lines.append(f"Notifiche oggi: {daily_notification_count.get(day_key, 0)}")
-            update.effective_message.reply_text("\n".join(lines))
-
-        def cmd_stats(update, context):  # type: ignore[unused-argument]
-            # Mostra ultimi 7 giorni
-            today = datetime.utcnow().date()
-            lines = ["Notifiche per giorno (ultimi 7 giorni):"]
-            for i in range(7):
-                d = today - timedelta(days=i)
-                k = d.strftime("%Y-%m-%d")
-                lines.append(f"- {k}: {daily_notification_count.get(k, 0)}")
-            update.effective_message.reply_text("\n".join(lines))
-
-        def cmd_live(update, context):  # type: ignore[unused-argument]
-            try:
-                fixtures = get_live_fixtures()
-            except Exception as e:
-                update.effective_message.reply_text(f"Errore nel recupero partite live: {e}")
-                return
-
-            total = len(fixtures)
-            if total == 0:
-                update.effective_message.reply_text("Nessuna partita live al momento.")
-                return
-
-            lines = [f"Partite live analizzate: {total}"]
-            shown = 0
-            for f in fixtures:
-                try:
-                    home = f["teams"]["home"]["name"]
-                    away = f["teams"]["away"]["name"]
-                    gh = f["goals"]["home"]
-                    ga = f["goals"]["away"]
-                    league = f["league"]["name"]
-                    country = f["league"].get("country", "")
-                    elapsed = f.get("fixture", {}).get("status", {}).get("elapsed")
-                    minutes = f"{elapsed}'" if elapsed is not None else ""
-                    lines.append(f"- {league} ({country}) — {home} {gh}-{ga} {away} {minutes}")
-                    shown += 1
-                    if shown >= 30:
-                        break
-                except Exception:
-                    continue
-
-            if total > shown:
-                lines.append(f"…e altre {total - shown} partite")
-
-            update.effective_message.reply_text("\n".join(lines)[:4000])
-
-        def cmd_quota(update, context):  # type: ignore[unused-argument]
-            min_sec = _recompute_min_interval_from_quota()
-            update.effective_message.reply_text(
-                f"Quota max 24h: {max_calls_per_day}\n"
-                f"Stima chiamate per check: {calls_per_check_estimate}\n"
-                f"Intervallo minimo da quota: {int(min_sec//60)} min\n"
-                f"Chiamate ultime 24h: {_calls_last_24h()}"
-            )
-
-        def cmd_force_check(update, context):  # type: ignore[unused-argument]
-            # Esegue un controllo immediato in un thread per non bloccare il dispatcher
-            def _run():
-                try:
-                    run_check_once()
-                    update.effective_message.reply_text("Controllo eseguito.")
-                except Exception as e:
-                    update.effective_message.reply_text(f"Errore: {e}")
-            Thread(target=_run, daemon=True).start()
-
-        def cmd_set_interval(update, context):  # type: ignore[unused-argument]
-            global poll_interval_seconds
-            try:
-                if not context.args:
-                    update.effective_message.reply_text("Uso: /set_interval <minuti>")
-                    return
-                minutes = int(context.args[0])
-                if minutes < 1 or minutes > 1440:
-                    update.effective_message.reply_text("Valore non valido (1-1440 minuti)")
-                    return
-                poll_interval_seconds = minutes * 60
-                update.effective_message.reply_text(f"Intervallo aggiornato a {minutes} minuti")
-            except Exception:
-                update.effective_message.reply_text("Uso: /set_interval <minuti>")
-
-        def cmd_set_quota(update, context):  # type: ignore[unused-argument]
-            global max_calls_per_day, calls_per_check_estimate, poll_interval_seconds
-            try:
-                if not context.args:
-                    update.effective_message.reply_text("Uso: /set_quota <max_24h> [stima_per_check]")
-                    return
-                new_max = int(context.args[0])
-                if new_max < 1 or new_max > 10000:
-                    update.effective_message.reply_text("Valore non valido (1-10000)")
-                    return
-                max_calls_per_day = new_max
-                if len(context.args) >= 2:
-                    est = int(context.args[1])
-                    if est < 1 or est > 100:
-                        update.effective_message.reply_text("Stima per check non valida (1-100)")
-                        return
-                    calls_per_check_estimate = est
-                # Applica nuovo minimo
-                min_from_quota = _recompute_min_interval_from_quota()
-                if poll_interval_seconds < min_from_quota:
-                    poll_interval_seconds = min_from_quota
-                update.effective_message.reply_text(
-                    f"Quota aggiornata. Max 24h: {max_calls_per_day}, stima/check: {calls_per_check_estimate}. "
-                    f"Intervallo minimo: {int(min_from_quota//60)} min"
-                )
-            except Exception:
-                update.effective_message.reply_text("Uso: /set_quota <max_24h> [stima_per_check]")
-
-        def cmd_help(update, context):  # type: ignore[unused-argument]
-            update.effective_message.reply_text(
-                "QrGolBot – Notifiche 1-1 live\n\n"
-                "Cosa fa: monitora in tempo reale tutte le partite (API-Football) "
-                "e invia un messaggio quando il punteggio diventa 1-1 con questi criteri: "
-                "stessa metà (1H), due gol di squadre opposte entro 10 minuti. "
-                "Il bot esegue controlli periodici e rispetta una quota giornaliera di chiamate API.\n\n"
-                "Variabili richieste: TELEGRAM_TOKEN, API_KEY, CHAT_ID. \n"
-                "Su Render, il bot espone anche una porta HTTP per rimanere attivo in free tier.\n\n"
-                "Comandi disponibili:\n"
-                "/ping – verifica se il bot è attivo\n"
-                "/live – elenco partite live analizzate (una chiamata)\n"
-                "/help – questa guida dettagliata\n"
-                "/status – mostra intervallo attuale, ultimo/prossimo check, errori e notifiche di oggi\n"
-                "/stats – notifiche per giorno (ultimi 7)\n"
-                "/force_check – esegue subito un controllo senza attendere l'intervallo\n"
-                "/set_interval <minuti> – imposta l'intervallo di polling (rispetta il minimo imposto dalla quota)\n"
-                "/quota – mostra quota massima 24h, stima chiamate per check, intervallo minimo e chiamate recenti\n"
-                "/set_quota <max_24h> [stima_per_check] – aggiorna la quota e ricalcola l'intervallo minimo\n"
-                "/see_all_request – mostra ultime richieste API e ultime notifiche inviate"
-            )
-
-        dp.add_handler(CommandHandler("status", cmd_status))
-        dp.add_handler(CommandHandler("stats", cmd_stats))
-        dp.add_handler(CommandHandler("force_check", cmd_force_check))
-        dp.add_handler(CommandHandler("live", cmd_live))
-        dp.add_handler(CommandHandler("set_interval", cmd_set_interval, pass_args=True))
-        dp.add_handler(CommandHandler("quota", cmd_quota))
-        dp.add_handler(CommandHandler("set_quota", cmd_set_quota, pass_args=True))
+        
+        # Registra comandi
+        dp.add_handler(CommandHandler("ping", cmd_ping))
         dp.add_handler(CommandHandler("help", cmd_help))
-
-        # Gestione comandi anche nei CANALI (channel_post). Nei canali i comandi arrivano come channel_post.
-        def handle_channel_command(update, context):  # type: ignore[unused-argument]
+        dp.add_handler(CommandHandler("status", cmd_status))
+        dp.add_handler(CommandHandler("live", cmd_live))
+        dp.add_handler(CommandHandler("active", cmd_active))
+        dp.add_handler(CommandHandler("stats", cmd_stats))
+        
+        # Gestione comandi nei canali
+        def handle_channel_command(update, context):
             post = getattr(update, "channel_post", None)
             if not post:
                 return
             text = post.text or post.caption or ""
             if not text.startswith("/"):
                 return
+            
             parts = text.split()
-            raw_cmd = parts[0]
-            # rimuove eventuale @botusername
-            cmd = raw_cmd.split("@")[0].lstrip("/")
-            args = parts[1:]
-
-            # Mappa ai callback già definiti
+            cmd = parts[0].split("@")[0].lstrip("/")
+            args = parts[1:] if len(parts) > 1 else []
+            
+            # Mappa comandi
             if cmd == "ping":
-                post.reply_text("pong")
-            elif cmd == "see_all_request":
-                cmd_see_all_request(update, context)
-            elif cmd == "status":
-                cmd_status(update, context)
-            elif cmd == "stats":
-                cmd_stats(update, context)
-            elif cmd == "force_check":
-                cmd_force_check(update, context)
-            elif cmd == "set_interval":
-                context.args = args  # passa args
-                cmd_set_interval(update, context)
-            elif cmd == "quota":
-                cmd_quota(update, context)
-            elif cmd == "set_quota":
-                context.args = args
-                cmd_set_quota(update, context)
-            elif cmd == "live":
-                cmd_live(update, context)
+                cmd_ping(update, context)
             elif cmd == "help":
                 cmd_help(update, context)
-
-        # In PTB 13.x non esiste ChannelPostHandler: usa MessageHandler con filtro channel_posts
+            elif cmd == "status":
+                cmd_status(update, context)
+            elif cmd == "live":
+                cmd_live(update, context)
+            elif cmd == "active":
+                cmd_active(update, context)
+            elif cmd == "stats":
+                cmd_stats(update, context)
+        
         dp.add_handler(MessageHandler(Filters.update.channel_posts, handle_channel_command))
+        
+        # Avvia polling
         updater.start_polling(drop_pending_updates=True)
-        print("Updater Telegram avviato per comandi (/see_all_request)")
+        print("✅ Updater Telegram avviato - Comandi disponibili")
+        return updater
     except Exception as e:
-        print("Updater non avviato:", e)
+        print(f"⚠️ Errore nell'avvio Updater: {e}")
+        return None
 
-    # Se è presente la variabile PORT (es. Render Web Service), esponi una porta HTTP
-    port = os.getenv("PORT")
 
-    if port:
-        class HealthHandler(BaseHTTPRequestHandler):
-            def do_GET(self):  # type: ignore[override]
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(b"OK")
-
-            def log_message(self, format, *args):  # noqa: A003 - silence default logging
-                return
-
-        # Avvia il loop di polling in background
-        t = Thread(target=main, daemon=True)
-        t.start()
-
-        # Avvia un piccolo HTTP server per soddisfare Render (porta obbligatoria)
-        server = HTTPServer(("0.0.0.0", int(port)), HealthHandler)
+def main():
+    """Loop principale: controlla partite ogni POLL_INTERVAL secondi"""
+    global last_check_started_at, last_check_finished_at, last_check_error
+    
+    print("Bot avviato. Monitoraggio partite live su FlashScore Mobile...")
+    
+    # Avvia Updater per comandi Telegram in background
+    updater = setup_telegram_commands()
+    
+    while True:
         try:
-            print(f"HTTP server in ascolto su 0.0.0.0:{port}")
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            server.server_close()
-    else:
-        # Ambiente locale / worker: esegui solo il polling
-        main()
+            last_check_started_at = datetime.now()
+            last_check_error = None
+            process_matches()
+            last_check_finished_at = datetime.now()
+        except Exception as e:
+            last_check_error = str(e)
+            print(f"Errore: {e}")
+        print(f"Attesa {POLL_INTERVAL} secondi prima del prossimo controllo...")
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
