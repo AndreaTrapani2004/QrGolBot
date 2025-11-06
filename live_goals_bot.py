@@ -9,7 +9,7 @@ import time
 import json
 from datetime import datetime, timedelta
 from telegram import Bot
-from telegram.ext import Updater, CommandHandler, ChannelPostHandler
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -39,6 +39,42 @@ import threading
 force_check_lock = threading.Lock()
 force_check_requested = False
 
+# ---------- QUOTA / RATE LIMIT ----------
+# Numero massimo di chiamate API consentite nelle ultime 24 ore (configurabile)
+max_calls_per_day = 100
+# Stima di quante chiamate consuma 1 "check" (fixtures + events, ecc.)
+calls_per_check_estimate = 1
+
+def _utc_now_iso():
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+def _calls_last_24h():
+    if not api_call_log:
+        return 0
+    now = datetime.utcnow()
+    cutoff = now - timedelta(days=1)
+    count = 0
+    for c in api_call_log:
+        try:
+            t = datetime.strptime(c["time"], "%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            # fallback: try without Z if needed
+            try:
+                t = datetime.fromisoformat(c["time"].replace("Z", ""))
+            except Exception:
+                continue
+        if t >= cutoff:
+            count += 1
+    return count
+
+def _recompute_min_interval_from_quota():
+    # Intervallo minimo per non sforare la quota, assumendo la stima per check
+    # 86400 sec/giorno * calls_per_check_estimate / max_calls_per_day
+    if max_calls_per_day <= 0 or calls_per_check_estimate <= 0:
+        return 86400  # fallback 24h
+    seconds = int((86400 * calls_per_check_estimate) / max_calls_per_day)
+    return max(1, seconds)
+
 # Base URL API-Football
 BASE_URL = "https://v3.football.api-sports.io"
 
@@ -66,11 +102,10 @@ def get_live_fixtures():
     endpoint = f"{BASE_URL}/fixtures"
     r = requests.get(endpoint, headers=headers, params=params, timeout=15)
     try:
-        ok = True
         return r.json().get("response", [])
     finally:
         api_call_log.append({
-            "time": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "time": _utc_now_iso(),
             "endpoint": endpoint,
             "params": params,
             "ok": r.ok,
@@ -85,7 +120,7 @@ def get_fixture_events(fixture_id):
         return r.json().get("response", [])
     finally:
         api_call_log.append({
-            "time": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "time": _utc_now_iso(),
             "endpoint": endpoint,
             "params": params,
             "ok": r.ok,
@@ -103,7 +138,7 @@ def send_message(home, away, league, country, first_score, first_min, second_sco
            f"{second_score} ; {second_min}'"
     bot.send_message(chat_id=CHAT_ID, text=text)
     notifications_log.append({
-        "time": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "time": _utc_now_iso(),
         "home": home,
         "away": away,
         "league": league,
@@ -195,14 +230,23 @@ def process_matches():
 def run_check_once():
     global last_check_started_at, last_check_finished_at, last_check_error
     last_check_error = None
-    last_check_started_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    last_check_started_at = _utc_now_iso()
+    # Se la quota è satura nelle ultime 24h, salta il check
+    try:
+        recent = _calls_last_24h()
+        if recent >= max_calls_per_day - calls_per_check_estimate:
+            # Salta per non superare la quota
+            last_check_error = "Quota giornaliera quasi raggiunta: check saltato"
+            return
+    except Exception:
+        pass
     try:
         process_matches()
     except Exception as e:
         last_check_error = str(e)
         raise
     finally:
-        last_check_finished_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        last_check_finished_at = _utc_now_iso()
 
 def main():
     global poll_interval_seconds
@@ -219,7 +263,12 @@ def main():
                 run_check_once()
         except Exception as e:
             print("Errore:", e)
-        # Attendi l'intervallo corrente (può essere aggiornato da /set_interval)
+        # Calcola la soglia minima dal quota e applica al poll interval
+        min_from_quota = _recompute_min_interval_from_quota()
+        if poll_interval_seconds < min_from_quota:
+            poll_interval_seconds = min_from_quota
+
+        # Attendi l'intervallo corrente (può essere aggiornato da /set_interval o da quota)
         sleep_left = poll_interval_seconds
         # Spezzetta il sleep per poter reagire prima a /force_check
         step = 1
@@ -244,6 +293,8 @@ if __name__ == "__main__":
             interval_min = int(poll_interval_seconds // 60)
             lines = []
             lines.append(f"Intervallo: {interval_min} min")
+            lines.append(f"Quota max 24h: {max_calls_per_day} (stima/check: {calls_per_check_estimate})")
+            lines.append(f"Chiamate ultime 24h: {_calls_last_24h()}")
             lines.append(f"Ultimo check start: {last_check_started_at}")
             lines.append(f"Ultimo check end: {last_check_finished_at}")
             if last_check_finished_at:
@@ -270,6 +321,15 @@ if __name__ == "__main__":
                 lines.append(f"- {k}: {daily_notification_count.get(k, 0)}")
             update.effective_message.reply_text("\n".join(lines))
 
+        def cmd_quota(update, context):  # type: ignore[unused-argument]
+            min_sec = _recompute_min_interval_from_quota()
+            update.effective_message.reply_text(
+                f"Quota max 24h: {max_calls_per_day}\n"
+                f"Stima chiamate per check: {calls_per_check_estimate}\n"
+                f"Intervallo minimo da quota: {int(min_sec//60)} min\n"
+                f"Chiamate ultime 24h: {_calls_last_24h()}"
+            )
+
         def cmd_force_check(update, context):  # type: ignore[unused-argument]
             # Esegue un controllo immediato in un thread per non bloccare il dispatcher
             def _run():
@@ -295,6 +355,34 @@ if __name__ == "__main__":
             except Exception:
                 update.effective_message.reply_text("Uso: /set_interval <minuti>")
 
+        def cmd_set_quota(update, context):  # type: ignore[unused-argument]
+            global max_calls_per_day, calls_per_check_estimate, poll_interval_seconds
+            try:
+                if not context.args:
+                    update.effective_message.reply_text("Uso: /set_quota <max_24h> [stima_per_check]")
+                    return
+                new_max = int(context.args[0])
+                if new_max < 1 or new_max > 10000:
+                    update.effective_message.reply_text("Valore non valido (1-10000)")
+                    return
+                max_calls_per_day = new_max
+                if len(context.args) >= 2:
+                    est = int(context.args[1])
+                    if est < 1 or est > 100:
+                        update.effective_message.reply_text("Stima per check non valida (1-100)")
+                        return
+                    calls_per_check_estimate = est
+                # Applica nuovo minimo
+                min_from_quota = _recompute_min_interval_from_quota()
+                if poll_interval_seconds < min_from_quota:
+                    poll_interval_seconds = min_from_quota
+                update.effective_message.reply_text(
+                    f"Quota aggiornata. Max 24h: {max_calls_per_day}, stima/check: {calls_per_check_estimate}. "
+                    f"Intervallo minimo: {int(min_from_quota//60)} min"
+                )
+            except Exception:
+                update.effective_message.reply_text("Uso: /set_quota <max_24h> [stima_per_check]")
+
         def cmd_help(update, context):  # type: ignore[unused-argument]
             update.effective_message.reply_text(
                 "Comandi disponibili:\n"
@@ -303,6 +391,8 @@ if __name__ == "__main__":
                 "/stats - notifiche per giorno (ultimi 7)\n"
                 "/force_check - esegue subito un controllo\n"
                 "/set_interval <minuti> - imposta intervallo di polling\n"
+                "/quota - mostra quota e intervallo minimo\n"
+                "/set_quota <max_24h> [stima_per_check] - configura quota\n"
                 "/see_all_request - ultime richieste API e notifiche"
             )
 
@@ -310,6 +400,8 @@ if __name__ == "__main__":
         dp.add_handler(CommandHandler("stats", cmd_stats))
         dp.add_handler(CommandHandler("force_check", cmd_force_check))
         dp.add_handler(CommandHandler("set_interval", cmd_set_interval, pass_args=True))
+        dp.add_handler(CommandHandler("quota", cmd_quota))
+        dp.add_handler(CommandHandler("set_quota", cmd_set_quota, pass_args=True))
         dp.add_handler(CommandHandler("help", cmd_help))
 
         # Gestione comandi anche nei CANALI (channel_post). Nei canali i comandi arrivano come channel_post.
@@ -340,10 +432,16 @@ if __name__ == "__main__":
             elif cmd == "set_interval":
                 context.args = args  # passa args
                 cmd_set_interval(update, context)
+            elif cmd == "quota":
+                cmd_quota(update, context)
+            elif cmd == "set_quota":
+                context.args = args
+                cmd_set_quota(update, context)
             elif cmd == "help":
                 cmd_help(update, context)
 
-        dp.add_handler(ChannelPostHandler(handle_channel_command))
+        # In PTB 13.x non esiste ChannelPostHandler: usa MessageHandler con filtro channel_posts
+        dp.add_handler(MessageHandler(Filters.update.channel_posts, handle_channel_command))
         updater.start_polling()
         print("Updater Telegram avviato per comandi (/see_all_request)")
     except Exception as e:
