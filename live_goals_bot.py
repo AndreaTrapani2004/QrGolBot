@@ -546,24 +546,14 @@ def process_matches():
                 # Recupera il PRIMO gol (goal_number=1) perché la partita è 1-0 o 0-1
                 goal_minute, goal_reliability = get_match_goal_minute(event_id, score_home, score_away, headers, goal_number=1)
                 
-                # Se non riusciamo a ottenere il minuto esatto, usa stima
+                # Se non riusciamo a ottenere il minuto esatto dall'API, NON tracciare la partita
                 if goal_minute is None:
-                    # Fallback: stima minuto del gol sottraendo 1-2 minuti dal minuto corrente
                     now_utc = datetime.utcnow().isoformat() + "Z"
-                    if minute and minute > 0:
-                        goal_minute = max(1, minute - 2)  # Minimo 1 minuto
-                        goal_reliability = max(0, match.get("reliability", 0) - 1)  # Riduci attendibilità
-                        print(f"[{now_utc}] ⚠️ FALLBACK (stima): primo gol al minuto {goal_minute}' (minuto corrente: {minute}', event_id={event_id})")
-                    elif minute == 0:
-                        goal_minute = 1
-                        goal_reliability = 0
-                        print(f"[{now_utc}] ⚠️ FALLBACK (stima): primo gol al minuto {goal_minute}' (minuto corrente: 0, event_id={event_id})")
-                    else:
-                        goal_minute = 0
-                        goal_reliability = 0
-                        print(f"[{now_utc}] ⚠️ FALLBACK (stima): primo gol al minuto {goal_minute}' (minuto corrente: N/A, event_id={event_id})")
+                    print(f"[{now_utc}] ⚠️ Partita NON tracciata: {home} - {away} ({first_score}) - minuto esatto non disponibile dall'API (event_id={event_id})")
                     sys.stdout.flush()
+                    continue  # Salta questa partita, non tracciarla
                 
+                # Solo se abbiamo il minuto esatto, traccia la partita
                 active_matches[match_id] = {
                     "home": home,
                     "away": away,
@@ -573,10 +563,9 @@ def process_matches():
                     "first_score": first_score,
                     "first_goal_minute": goal_minute,
                     "first_goal_period": period,  # Salva metà tempo del primo gol
-                    "first_goal_reliability": goal_reliability  # Attendibilità del minuto gol
+                    "first_goal_reliability": goal_reliability  # Attendibilità del minuto gol (sempre 5 se esatto)
                 }
-                source = "ESATTO (API)" if goal_reliability == 5 else "FALLBACK (stima)"
-                print(f"Nuova partita tracciata: {home} - {away} ({first_score}) al minuto {goal_minute}' - {source} (attendibilità {goal_reliability}/5)")
+                print(f"Nuova partita tracciata: {home} - {away} ({first_score}) al minuto {goal_minute}' - ESATTO (API) (attendibilità {goal_reliability}/5)")
         
         # CASO 2: Partita già tracciata (1-0/0-1) che diventa 1-1
         elif score_home == 1 and score_away == 1:
@@ -599,15 +588,16 @@ def process_matches():
                 # Recupera il SECONDO gol (goal_number=2) perché la partita è diventata 1-1
                 second_goal_minute, second_goal_reliability = get_match_goal_minute(event_id, score_home, score_away, headers, goal_number=2)
                 
-                # Se non riusciamo a ottenere il minuto esatto, usa minuto corrente
+                # Se non riusciamo a ottenere il minuto esatto dall'API, NON notificare
                 if second_goal_minute is None:
-                    second_min = minute if minute is not None else 0
-                    second_goal_reliability = match.get("reliability", 0)
                     now_utc = datetime.utcnow().isoformat() + "Z"
-                    print(f"[{now_utc}] ⚠️ FALLBACK (stima): secondo gol al minuto {second_min}' (minuto corrente: {minute if minute is not None else 'N/A'}', event_id={event_id})")
+                    print(f"[{now_utc}] ⚠️ Notifica NON inviata: {home} - {away} ({first_score} → 1-1) - minuto esatto secondo gol non disponibile dall'API (event_id={event_id})")
                     sys.stdout.flush()
-                else:
-                    second_min = second_goal_minute
+                    del active_matches[match_id]  # Rimuovi dal tracking
+                    continue  # Salta questa partita, non notificare
+                
+                # Solo se abbiamo il minuto esatto, procedi con la notifica
+                second_min = second_goal_minute
                 
                 second_period = match.get("period")  # Metà tempo corrente
                 
@@ -627,16 +617,16 @@ def process_matches():
                     print(f"Partita scartata (gol in metà tempo diverse): {home} - {away} ({first_score} al {first_min}' → 1-1 al {second_min}')")
                     continue
                 
-                # Calcola differenza in minuti di gioco
+                # Calcola differenza in minuti di gioco (solo se abbiamo minuti esatti)
                 if first_min > 0 and second_min > 0:
                     elapsed_game_minutes = second_min - first_min
                 else:
-                    # Fallback: usa tempo reale se minuti di gioco non disponibili
-                    first_goal_time = match_data.get("first_goal_time")
-                    if first_goal_time:
-                        elapsed_game_minutes = (now - first_goal_time).total_seconds() / 60
-                    else:
-                        elapsed_game_minutes = 999  # Non valido, non notificare
+                    # Se non abbiamo minuti esatti, non notificare
+                    now_utc = datetime.utcnow().isoformat() + "Z"
+                    print(f"[{now_utc}] ⚠️ Notifica NON inviata: {home} - {away} ({first_score} → 1-1) - minuti esatti non disponibili (first_min={first_min}, second_min={second_min})")
+                    sys.stdout.flush()
+                    del active_matches[match_id]
+                    continue
                 
                 # Se è diventata 1-1 entro 10 minuti di gioco E stessa metà tempo, invia notifica
                 if elapsed_game_minutes <= 10 and elapsed_game_minutes >= 0:
@@ -658,9 +648,8 @@ def process_matches():
                         "notified_at": now.isoformat()
                     }
                     del active_matches[match_id]
-                    first_source = "ESATTO" if match_data.get("first_goal_reliability", 0) == 5 else "FALLBACK"
-                    second_source = "ESATTO" if second_goal_reliability == 5 else "FALLBACK"
-                    print(f"Notifica inviata: {home} - {away} ({first_score} al {first_min}' [{first_source}] → 1-1 al {second_min}' [{second_source}]) - {elapsed_game_minutes:.1f} min di gioco (stessa metà tempo, attendibilità {combined_reliability}/5)")
+                    # Entrambi i minuti sono sempre esatti (solo se disponibili dall'API)
+                    print(f"Notifica inviata: {home} - {away} ({first_score} al {first_min}' [ESATTO] → 1-1 al {second_min}' [ESATTO]) - {elapsed_game_minutes:.1f} min di gioco (stessa metà tempo, attendibilità {combined_reliability}/5)")
                 else:
                     # Scaduta, rimuovi dal tracking
                     del active_matches[match_id]
