@@ -24,6 +24,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID"))
 POLL_INTERVAL = 60  # 1 minuto = 60 secondi
 SOFASCORE_API_URL = "https://api.sofascore.com/api/v1"
+# Proxy opzionale per SofaScore (es. Cloudflare Workers). Se settato, sostituisce la base URL.
+SOFASCORE_PROXY_BASE = os.getenv("SOFASCORE_PROXY_BASE", SOFASCORE_API_URL)
 
 # Bot Telegram
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -90,7 +92,12 @@ def _fetch_sofascore_json(url, headers):
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code == 200:
-            return resp.json()
+            try:
+                return resp.json()
+            except Exception:
+                print(f"[{now_utc}] ⚠️ JSON non valido dalla API diretta, lunghezza body={len(resp.text)}")
+                sys.stdout.flush()
+                return None
         if resp.status_code != 403:
             print(f"[{now_utc}] ⚠️ Errore API SofaScore: status={resp.status_code}")
             sys.stdout.flush()
@@ -101,14 +108,26 @@ def _fetch_sofascore_json(url, headers):
         proxy_url = f"https://r.jina.ai/{inner}"
         print(f"[{now_utc}] 🔁 Fallback via r.jina.ai: {proxy_url}")
         sys.stdout.flush()
-        prox_resp = requests.get(proxy_url, headers={"User-Agent": headers.get("User-Agent", "Mozilla/5.0"), "Accept": "application/json"}, timeout=20)
+        prox_resp = requests.get(
+            proxy_url,
+            headers={
+                "User-Agent": headers.get("User-Agent", "Mozilla/5.0"),
+                "Accept": "application/json",
+            },
+            timeout=20,
+        )
         if prox_resp.status_code == 200:
             try:
                 return prox_resp.json()
             except Exception:
                 # Alcuni proxy restituiscono testo JSON valido: prova json.loads
                 import json as _json
-                return _json.loads(prox_resp.text)
+                try:
+                    return _json.loads(prox_resp.text)
+                except Exception:
+                    print(f"[{now_utc}] ⚠️ Impossibile parsare JSON dal fallback, primi 200 char: {prox_resp.text[:200]!r}")
+                    sys.stdout.flush()
+                    return None
         print(f"[{now_utc}] ⚠️ Fallback r.jina.ai fallito: status={prox_resp.status_code}")
         sys.stdout.flush()
         return None
@@ -130,23 +149,42 @@ def scrape_sofascore():
             "Origin": "https://www.sofascore.com"
         }
         
-        # Endpoint per partite live
-        url = f"{SOFASCORE_API_URL}/sport/football/events/live"
+        # Prova multipli endpoint per recuperare eventi live
+        endpoints = [
+            f"{SOFASCORE_PROXY_BASE}/sport/football/events/live",
+            f"{SOFASCORE_PROXY_BASE}/sport/football/events/inplay",
+            f"{SOFASCORE_PROXY_BASE}/sport/football/livescore",
+        ]
         
         now_utc = datetime.utcnow().isoformat() + "Z"
-        print(f"[{now_utc}] Richiesta API SofaScore: {url}...")
-        sys.stdout.flush()
-
-        # Semplice retry in caso di errore temporaneo
-        data = _fetch_sofascore_json(url, headers)
-        if data is None:
-            return []
-        matches = []
+        events = []
+        for idx, url in enumerate(endpoints, start=1):
+            print(f"[{now_utc}] Richiesta API SofaScore: {url}... (tentativo {idx})")
+            sys.stdout.flush()
+            data = _fetch_sofascore_json(url, headers)
+            if not data:
+                continue
+            # Normalizza le possibili chiavi
+            events = data.get("events") or data.get("results") or []
+            print(f"[{now_utc}] ✅ Trovate {len(events)} partite live dalla API (tentativo {idx})")
+            sys.stdout.flush()
+            if events:
+                break
+            else:
+                # Log breve del payload per capire il formato
+                try:
+                    import json as _json
+                    raw = _json.dumps(data)[:200]
+                except Exception:
+                    raw = str(data)[:200]
+                print(f"[{now_utc}] ℹ️ Nessun evento nell'endpoint, anteprima payload: {raw}")
+                sys.stdout.flush()
         
-        # Estrai partite dai dati JSON
-        events = data.get("events", [])
-        print(f"[{now_utc}] ✅ Trovate {len(events)} partite live dalla API")
-        sys.stdout.flush()
+        matches = []
+        if not events:
+            print(f"[{now_utc}] ⚠️ Nessun evento trovato su tutti gli endpoint live")
+            sys.stdout.flush()
+            return []
         
         for event in events:
             try:
@@ -294,7 +332,7 @@ def send_message(home, away, league, country, first_score, first_min, second_sco
         f"{header}\n"
         f"{reliability_str}\n"
         f"{first_score} ; {first_min}'\n"
-        f"{second_score} ; {second_min}'"
+           f"{second_score} ; {second_min}'"
     )
     bot.send_message(chat_id=CHAT_ID, text=text)
     
