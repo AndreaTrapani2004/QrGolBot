@@ -38,13 +38,18 @@ SENT_MATCHES_FILE = "sent_matches.json"
 
 # ---------- FUNZIONI UTILI ----------
 def load_active_matches():
-    """Carica le partite attive in tracking (1-0/0-1) da file"""
+    """Carica le partite attive in tracking (0-0 o 1-0/0-1) da file"""
     try:
         with open(ACTIVE_MATCHES_FILE, "r") as f:
             data = json.load(f)
-            # Converti timestamp string in datetime
+            # Converti timestamp string in datetime (solo se esiste)
             for match_id, match_data in data.items():
-                match_data["first_goal_time"] = datetime.fromisoformat(match_data["first_goal_time"])
+                if "first_goal_time" in match_data:
+                    try:
+                        match_data["first_goal_time"] = datetime.fromisoformat(match_data["first_goal_time"])
+                    except:
+                        # Se la conversione fallisce, rimuovi la chiave
+                        del match_data["first_goal_time"]
             return data
     except Exception:
         return {}
@@ -52,11 +57,16 @@ def load_active_matches():
 
 def save_active_matches(active_matches):
     """Salva le partite attive in tracking su file"""
-    # Converti datetime in string per JSON
+    # Converti datetime in string per JSON (solo se esiste)
     data = {}
     for match_id, match_data in active_matches.items():
         data[match_id] = match_data.copy()
-        data[match_id]["first_goal_time"] = match_data["first_goal_time"].isoformat()
+        if "first_goal_time" in match_data and match_data["first_goal_time"]:
+            # Converti datetime in string solo se esiste
+            if isinstance(match_data["first_goal_time"], datetime):
+                data[match_id]["first_goal_time"] = match_data["first_goal_time"].isoformat()
+            # Se è già una stringa, lasciala così
+        # Se non esiste (partite 0-0), non aggiungere la chiave
     
     with open(ACTIVE_MATCHES_FILE, "w") as f:
         json.dump(data, f, indent=2)
@@ -914,7 +924,18 @@ def cmd_active(update, context):
         live_dict = {}
     
     for match_id, match_data in list(filtered.items())[:15]:  # Limita a 15
-        first_goal_time = match_data["first_goal_time"]
+        first_goal_time = match_data.get("first_goal_time")
+        if not first_goal_time:
+            # Se non c'è first_goal_time, salta questa partita (probabilmente è ancora 0-0)
+            continue
+        
+        # Converti stringa ISO in datetime se necessario
+        if isinstance(first_goal_time, str):
+            try:
+                first_goal_time = datetime.fromisoformat(first_goal_time)
+            except:
+                continue
+        
         elapsed_minutes = (now - first_goal_time).total_seconds() / 60
         remaining = max(0, 10 - elapsed_minutes)
         
