@@ -6,6 +6,7 @@ Traccia partite in stato 1-0/0-1 e notifica quando diventano 1-1 entro 10 minuti
 """
 
 import time
+import sys
 import json
 import os
 import re
@@ -98,11 +99,22 @@ def scrape_sofascore():
         # Endpoint per partite live
         url = f"{SOFASCORE_API_URL}/sport/football/events/live"
         
-        print(f"Richiesta API SofaScore: {url}...")
-        response = requests.get(url, headers=headers, timeout=10)
+        now_utc = datetime.utcnow().isoformat() + "Z"
+        print(f"[{now_utc}] Richiesta API SofaScore: {url}...")
+        sys.stdout.flush()
+
+        # Semplice retry in caso di errore temporaneo
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+        except Exception as e:
+            print(f"[{now_utc}] ⚠️ Eccezione durante la richiesta API: {e}")
+            sys.stdout.flush()
+            time.sleep(1)
+            response = requests.get(url, headers=headers, timeout=15)
         
         if response.status_code != 200:
-            print(f"⚠️ Errore API SofaScore: {response.status_code}")
+            print(f"[{now_utc}] ⚠️ Errore API SofaScore: status={response.status_code}")
+            sys.stdout.flush()
             return []
         
         data = response.json()
@@ -110,7 +122,8 @@ def scrape_sofascore():
         
         # Estrai partite dai dati JSON
         events = data.get("events", [])
-        print(f"✅ Trovate {len(events)} partite live")
+        print(f"[{now_utc}] ✅ Trovate {len(events)} partite live dalla API")
+        sys.stdout.flush()
         
         for event in events:
             try:
@@ -226,14 +239,19 @@ def scrape_sofascore():
                 print(f"Errore nell'estrazione partita: {e}")
                 continue
         
-        print(f"✅ Estratte {len(matches)} partite da SofaScore (stato ≠ 0-0)")
+        print(f"[{now_utc}] ✅ Estratte {len(matches)} partite totali dalla risposta")
+        sys.stdout.flush()
         return matches
     
     except requests.exceptions.RequestException as e:
-        print(f"Errore nella richiesta API SofaScore: {e}")
+        now_utc = datetime.utcnow().isoformat() + "Z"
+        print(f"[{now_utc}] Errore nella richiesta API SofaScore: {e}")
+        sys.stdout.flush()
         return []
     except Exception as e:
-        print(f"Errore nello scraping SofaScore: {e}")
+        now_utc = datetime.utcnow().isoformat() + "Z"
+        print(f"[{now_utc}] Errore nello scraping SofaScore: {e}")
+        sys.stdout.flush()
         return []
 
 
@@ -946,6 +964,7 @@ def main():
     global last_check_started_at, last_check_finished_at, last_check_error
     
     print("Bot avviato. Monitoraggio partite live su SofaScore...")
+    sys.stdout.flush()
     
     # Avvia HTTP server per keep-alive (se PORT è definito, usa quello)
     port = int(os.getenv('PORT', 8080))
@@ -957,13 +976,21 @@ def main():
     while True:
         try:
             last_check_started_at = datetime.now()
+            cycle_start_utc = datetime.utcnow().isoformat() + "Z"
+            print(f"[${cycle_start_utc}] ▶️ Inizio ciclo controllo partite")
+            sys.stdout.flush()
             last_check_error = None
             process_matches()
             last_check_finished_at = datetime.now()
+            cycle_end_utc = datetime.utcnow().isoformat() + "Z"
+            print(f"[${cycle_end_utc}] ⏹️ Fine ciclo controllo partite")
+            sys.stdout.flush()
         except Exception as e:
             last_check_error = str(e)
             print(f"Errore: {e}")
+            sys.stdout.flush()
         print(f"Attesa {POLL_INTERVAL} secondi prima del prossimo controllo...")
+        sys.stdout.flush()
         time.sleep(POLL_INTERVAL)
 
 
