@@ -244,13 +244,17 @@ def send_message(home, away, league, country, first_score, first_min, second_sco
     # Emoji per attendibilità
     reliability_emoji = ["❌", "⚠️", "⚠️", "✅", "✅", "✅✅"]
     reliability_text = ["Nessun dato", "Basso", "Medio", "Buono", "Alto", "Massimo"]
-    
-    reliability_str = f"{reliability_emoji[min(reliability, 5)]} Attendibilità: {reliability}/5 ({reliability_text[min(reliability, 5)]})"
-    
-    text = f"{home} - {away} ({league} - {country})\n" \
-           f"{first_score} ; {first_min}'\n" \
-           f"{second_score} ; {second_min}'\n\n" \
-           f"{reliability_str}"
+    reliability_idx = min(reliability, 5)
+
+    header = f"{reliability_emoji[reliability_idx]} {home} - {away} ({league} - {country})"
+    reliability_str = f"Attendibilità: {reliability}/5 ({reliability_text[reliability_idx]})"
+
+    text = (
+        f"{header}\n"
+        f"{reliability_str}\n"
+        f"{first_score} ; {first_min}'\n"
+        f"{second_score} ; {second_min}'"
+    )
     bot.send_message(chat_id=CHAT_ID, text=text)
     
     # Aggiorna statistiche
