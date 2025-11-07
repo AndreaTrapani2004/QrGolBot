@@ -893,15 +893,38 @@ def setup_telegram_commands():
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     """Handler per HTTP server di keep-alive"""
+    def _send_health_response(self):
+        """Invia risposta di health check"""
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.send_header('Content-Length', '2')
+        self.end_headers()
+        self.wfile.write(b'OK')
+    
     def do_GET(self):
+        """Gestisce richieste GET"""
         if self.path == '/health' or self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'OK')
+            self._send_health_response()
         else:
             self.send_response(404)
             self.end_headers()
+    
+    def do_HEAD(self):
+        """Gestisce richieste HEAD (usate da Render e UptimeRobot)"""
+        if self.path == '/health' or self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.send_header('Content-Length', '2')
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def do_OPTIONS(self):
+        """Gestisce richieste OPTIONS"""
+        self.send_response(200)
+        self.send_header('Allow', 'GET, HEAD, OPTIONS')
+        self.end_headers()
     
     def log_message(self, format, *args):
         # Disabilita logging HTTP per ridurre spam
