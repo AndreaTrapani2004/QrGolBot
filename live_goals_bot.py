@@ -84,6 +84,40 @@ def get_match_id(home, away, league):
     return f"{home}_{away}_{league}".lower().replace(" ", "_")
 
 
+def _fetch_sofascore_json(url, headers):
+    """Tenta fetch diretto; su 403 usa fallback r.jina.ai come proxy pubblico."""
+    now_utc = datetime.utcnow().isoformat() + "Z"
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code != 403:
+            print(f"[{now_utc}] ⚠️ Errore API SofaScore: status={resp.status_code}")
+            sys.stdout.flush()
+            return None
+        # Fallback via r.jina.ai (no crediti, spesso evita blocchi IP)
+        # Convertiamo https://... in http://... per l'URL interno
+        inner = url.replace("https://", "http://")
+        proxy_url = f"https://r.jina.ai/{inner}"
+        print(f"[{now_utc}] 🔁 Fallback via r.jina.ai: {proxy_url}")
+        sys.stdout.flush()
+        prox_resp = requests.get(proxy_url, headers={"User-Agent": headers.get("User-Agent", "Mozilla/5.0"), "Accept": "application/json"}, timeout=20)
+        if prox_resp.status_code == 200:
+            try:
+                return prox_resp.json()
+            except Exception:
+                # Alcuni proxy restituiscono testo JSON valido: prova json.loads
+                import json as _json
+                return _json.loads(prox_resp.text)
+        print(f"[{now_utc}] ⚠️ Fallback r.jina.ai fallito: status={prox_resp.status_code}")
+        sys.stdout.flush()
+        return None
+    except Exception as e:
+        print(f"[{now_utc}] ⚠️ Eccezione fetch SofaScore: {e}")
+        sys.stdout.flush()
+        return None
+
+
 def scrape_sofascore():
     """Ottiene tutte le partite live tramite API SofaScore"""
     try:
@@ -104,20 +138,9 @@ def scrape_sofascore():
         sys.stdout.flush()
 
         # Semplice retry in caso di errore temporaneo
-        try:
-            response = requests.get(url, headers=headers, timeout=15)
-        except Exception as e:
-            print(f"[{now_utc}] ⚠️ Eccezione durante la richiesta API: {e}")
-            sys.stdout.flush()
-            time.sleep(1)
-            response = requests.get(url, headers=headers, timeout=15)
-        
-        if response.status_code != 200:
-            print(f"[{now_utc}] ⚠️ Errore API SofaScore: status={response.status_code}")
-            sys.stdout.flush()
+        data = _fetch_sofascore_json(url, headers)
+        if data is None:
             return []
-        
-        data = response.json()
         matches = []
         
         # Estrai partite dai dati JSON
