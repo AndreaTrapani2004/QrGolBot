@@ -432,6 +432,21 @@ def process_matches():
                 # Nuova partita da tracciare
                 first_score = "1-0" if score_home == 1 else "0-1"
                 period = match.get("period")  # 1 = primo tempo, 2 = secondo tempo
+                
+                # Stima minuto del gol: sottrai 1-2 minuti dal minuto corrente
+                # (assumendo che il gol sia stato segnato poco prima della rilevazione)
+                estimated_goal_minute = 0
+                original_reliability = match.get("reliability", 0)
+                # Riduci attendibilità perché è una stima, non il minuto esatto
+                estimated_reliability = max(0, original_reliability - 1) if original_reliability > 0 else 0
+                
+                if minute and minute > 0:
+                    # Sottrai 1-2 minuti come stima (il gol è stato segnato prima del controllo)
+                    estimated_goal_minute = max(1, minute - 2)  # Minimo 1 minuto
+                elif minute == 0:
+                    # Se minuto è 0, potrebbe essere all'inizio, usa 1 come fallback
+                    estimated_goal_minute = 1
+                
                 active_matches[match_id] = {
                     "home": home,
                     "away": away,
@@ -439,11 +454,11 @@ def process_matches():
                     "country": country,
                     "first_goal_time": now,
                     "first_score": first_score,
-                    "first_goal_minute": minute if minute else 0,
+                    "first_goal_minute": estimated_goal_minute,
                     "first_goal_period": period,  # Salva metà tempo del primo gol
-                    "first_goal_reliability": match.get("reliability", 0)  # Salva attendibilità del primo gol
+                    "first_goal_reliability": estimated_reliability  # Attendibilità ridotta perché è una stima
                 }
-                print(f"Nuova partita tracciata: {home} - {away} ({first_score}) al minuto {minute if minute else 'N/A'}")
+                print(f"Nuova partita tracciata: {home} - {away} ({first_score}) al minuto stimato {estimated_goal_minute} (minuto corrente: {minute if minute else 'N/A'})")
         
         # CASO 2: Partita già tracciata (1-0/0-1) che diventa 1-1
         elif score_home == 1 and score_away == 1:
