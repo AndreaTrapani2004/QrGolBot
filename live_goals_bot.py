@@ -300,6 +300,9 @@ def scrape_sofascore():
                     else:
                         period = 2
                 
+                # Estrai ID partita per recuperare eventi/gol
+                event_id = event.get("id")
+                
                 matches.append({
                     "home": home,
                     "away": away,
@@ -309,7 +312,8 @@ def scrape_sofascore():
                     "country": country,
                     "minute": minute,
                     "period": period,  # 1 = primo tempo, 2 = secondo tempo
-                    "reliability": reliability  # Attendibilità 0-5
+                    "reliability": reliability,  # Attendibilità 0-5
+                    "event_id": event_id  # ID partita per recuperare eventi/gol
                 })
             except Exception as e:
                 print(f"Errore nell'estrazione partita: {e}")
@@ -329,6 +333,54 @@ def scrape_sofascore():
         print(f"[{now_utc}] Errore nello scraping SofaScore: {e}")
         sys.stdout.flush()
         return []
+
+
+def get_match_goal_minute(event_id, score_home, score_away, headers):
+    """Recupera il minuto esatto dell'ultimo gol dalla partita tramite API SofaScore"""
+    if not event_id:
+        return None, 0
+    
+    try:
+        # Endpoint per eventi/incidents della partita
+        url = f"{SOFASCORE_PROXY_BASE}/event/{event_id}/incidents"
+        
+        now_utc = datetime.utcnow().isoformat() + "Z"
+        data = _fetch_sofascore_json(url, headers)
+        
+        if not data:
+            return None, 0
+        
+        # Estrai incidents/events
+        incidents = data.get("incidents") or data.get("events") or []
+        
+        # Cerca l'ultimo gol (goal) che corrisponde al punteggio
+        # Tipicamente i gol hanno type=100 (goal) o type=101 (own goal)
+        last_goal = None
+        last_goal_minute = None
+        
+        for incident in incidents:
+            incident_type = incident.get("type", {}).get("id") if isinstance(incident.get("type"), dict) else incident.get("type")
+            # Type 100 = goal, 101 = own goal
+            if incident_type in [100, 101]:
+                # Estrai minuto
+                minute = incident.get("minute")
+                if minute is not None:
+                    # Verifica che sia un gol valido (non un gol annullato)
+                    is_valid = incident.get("isHome", None)
+                    if is_valid is not None:  # Se ha isHome, è un gol valido
+                        if last_goal_minute is None or minute > last_goal_minute:
+                            last_goal = incident
+                            last_goal_minute = minute
+        
+        if last_goal_minute is not None:
+            return last_goal_minute, 5  # Attendibilità massima perché è il minuto esatto dall'API
+        
+        return None, 0
+    except Exception as e:
+        now_utc = datetime.utcnow().isoformat() + "Z"
+        print(f"[{now_utc}] ⚠️ Errore recupero minuto gol da eventi: {e}")
+        sys.stdout.flush()
+        return None, 0
 
 
 def send_message(home, away, league, country, first_score, first_min, second_score, second_min, reliability=0):
@@ -432,20 +484,31 @@ def process_matches():
                 # Nuova partita da tracciare
                 first_score = "1-0" if score_home == 1 else "0-1"
                 period = match.get("period")  # 1 = primo tempo, 2 = secondo tempo
+                event_id = match.get("event_id")
                 
-                # Stima minuto del gol: sottrai 1-2 minuti dal minuto corrente
-                # (assumendo che il gol sia stato segnato poco prima della rilevazione)
-                estimated_goal_minute = 0
-                original_reliability = match.get("reliability", 0)
-                # Riduci attendibilità perché è una stima, non il minuto esatto
-                estimated_reliability = max(0, original_reliability - 1) if original_reliability > 0 else 0
+                # Prova a recuperare il minuto esatto del gol dall'API
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "application/json",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://www.sofascore.com/",
+                    "Origin": "https://www.sofascore.com"
+                }
                 
-                if minute and minute > 0:
-                    # Sottrai 1-2 minuti come stima (il gol è stato segnato prima del controllo)
-                    estimated_goal_minute = max(1, minute - 2)  # Minimo 1 minuto
-                elif minute == 0:
-                    # Se minuto è 0, potrebbe essere all'inizio, usa 1 come fallback
-                    estimated_goal_minute = 1
+                goal_minute, goal_reliability = get_match_goal_minute(event_id, score_home, score_away, headers)
+                
+                # Se non riusciamo a ottenere il minuto esatto, usa stima
+                if goal_minute is None:
+                    # Fallback: stima minuto del gol sottraendo 1-2 minuti dal minuto corrente
+                    if minute and minute > 0:
+                        goal_minute = max(1, minute - 2)  # Minimo 1 minuto
+                        goal_reliability = max(0, match.get("reliability", 0) - 1)  # Riduci attendibilità
+                    elif minute == 0:
+                        goal_minute = 1
+                        goal_reliability = 0
+                    else:
+                        goal_minute = 0
+                        goal_reliability = 0
                 
                 active_matches[match_id] = {
                     "home": home,
@@ -454,11 +517,11 @@ def process_matches():
                     "country": country,
                     "first_goal_time": now,
                     "first_score": first_score,
-                    "first_goal_minute": estimated_goal_minute,
+                    "first_goal_minute": goal_minute,
                     "first_goal_period": period,  # Salva metà tempo del primo gol
-                    "first_goal_reliability": estimated_reliability  # Attendibilità ridotta perché è una stima
+                    "first_goal_reliability": goal_reliability  # Attendibilità del minuto gol
                 }
-                print(f"Nuova partita tracciata: {home} - {away} ({first_score}) al minuto stimato {estimated_goal_minute} (minuto corrente: {minute if minute else 'N/A'})")
+                print(f"Nuova partita tracciata: {home} - {away} ({first_score}) al minuto {goal_minute} (attendibilità {goal_reliability}/5)")
         
         # CASO 2: Partita già tracciata (1-0/0-1) che diventa 1-1
         elif score_home == 1 and score_away == 1:
@@ -467,7 +530,26 @@ def process_matches():
                 first_score = match_data["first_score"]
                 first_min = match_data.get("first_goal_minute", 0)
                 first_period = match_data.get("first_goal_period")  # 1 = primo tempo, 2 = secondo tempo
-                second_min = minute if minute is not None else 0
+                event_id = match.get("event_id")
+                
+                # Prova a recuperare il minuto esatto del secondo gol dall'API
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "application/json",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://www.sofascore.com/",
+                    "Origin": "https://www.sofascore.com"
+                }
+                
+                second_goal_minute, second_goal_reliability = get_match_goal_minute(event_id, score_home, score_away, headers)
+                
+                # Se non riusciamo a ottenere il minuto esatto, usa minuto corrente
+                if second_goal_minute is None:
+                    second_min = minute if minute is not None else 0
+                    second_goal_reliability = match.get("reliability", 0)
+                else:
+                    second_min = second_goal_minute
+                
                 second_period = match.get("period")  # Metà tempo corrente
                 
                 # VERIFICA: Entrambi i gol devono essere nella stessa metà tempo
@@ -501,8 +583,7 @@ def process_matches():
                 if elapsed_game_minutes <= 10 and elapsed_game_minutes >= 0:
                     # Calcola attendibilità combinata (minimo tra i due)
                     first_reliability = match_data.get("first_goal_reliability", 0)
-                    second_reliability = match.get("reliability", 0)
-                    combined_reliability = min(first_reliability, second_reliability)
+                    combined_reliability = min(first_reliability, second_goal_reliability)
                     
                     send_message(home, away, league, country, first_score, first_min, "1-1", second_min, combined_reliability)
                     # Salva dettagli della partita notificata
