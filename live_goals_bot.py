@@ -335,8 +335,17 @@ def scrape_sofascore():
         return []
 
 
-def get_match_goal_minute(event_id, score_home, score_away, headers):
-    """Recupera il minuto esatto dell'ultimo gol dalla partita tramite API SofaScore"""
+def get_match_goal_minute(event_id, score_home, score_away, headers, goal_number=1):
+    """
+    Recupera il minuto esatto di un gol dalla partita tramite API SofaScore
+    
+    Args:
+        event_id: ID della partita
+        score_home: Punteggio casa
+        score_away: Punteggio trasferta
+        headers: Headers HTTP per la richiesta
+        goal_number: 1 = primo gol, 2 = secondo gol, -1 = ultimo gol
+    """
     if not event_id:
         return None, 0
     
@@ -353,29 +362,54 @@ def get_match_goal_minute(event_id, score_home, score_away, headers):
         # Estrai incidents/events
         incidents = data.get("incidents") or data.get("events") or []
         
-        # Cerca l'ultimo gol (goal) che corrisponde al punteggio
-        # Tipicamente i gol hanno type=100 (goal) o type=101 (own goal)
-        last_goal = None
-        last_goal_minute = None
-        
+        # Filtra solo i gol (type=100 goal, type=101 own goal)
+        goals = []
         for incident in incidents:
-            incident_type = incident.get("type", {}).get("id") if isinstance(incident.get("type"), dict) else incident.get("type")
+            incident_type = incident.get("type", {})
+            if isinstance(incident_type, dict):
+                type_id = incident_type.get("id")
+            else:
+                type_id = incident_type
+            
             # Type 100 = goal, 101 = own goal
-            if incident_type in [100, 101]:
-                # Estrai minuto
+            if type_id in [100, 101]:
                 minute = incident.get("minute")
                 if minute is not None:
                     # Verifica che sia un gol valido (non un gol annullato)
-                    is_valid = incident.get("isHome", None)
-                    if is_valid is not None:  # Se ha isHome, è un gol valido
-                        if last_goal_minute is None or minute > last_goal_minute:
-                            last_goal = incident
-                            last_goal_minute = minute
+                    # I gol hanno isHome o isAway per indicare quale squadra ha segnato
+                    is_home = incident.get("isHome", False)
+                    is_away = incident.get("isAway", False)
+                    if is_home is not None or is_away is not None:  # Gol valido
+                        goals.append({
+                            "minute": minute,
+                            "is_home": is_home,
+                            "incident": incident
+                        })
         
-        if last_goal_minute is not None:
-            return last_goal_minute, 5  # Attendibilità massima perché è il minuto esatto dall'API
+        if not goals:
+            return None, 0
         
-        return None, 0
+        # Ordina per minuto (cronologico)
+        goals.sort(key=lambda x: x["minute"])
+        
+        # Seleziona il gol richiesto
+        if goal_number == -1:
+            # Ultimo gol
+            selected_goal = goals[-1]
+        elif goal_number == 1:
+            # Primo gol
+            selected_goal = goals[0]
+        elif goal_number == 2:
+            # Secondo gol
+            if len(goals) >= 2:
+                selected_goal = goals[1]
+            else:
+                return None, 0
+        else:
+            # Numero gol non valido
+            return None, 0
+        
+        return selected_goal["minute"], 5  # Attendibilità massima perché è il minuto esatto dall'API
     except Exception as e:
         now_utc = datetime.utcnow().isoformat() + "Z"
         print(f"[{now_utc}] ⚠️ Errore recupero minuto gol da eventi: {e}")
@@ -495,7 +529,8 @@ def process_matches():
                     "Origin": "https://www.sofascore.com"
                 }
                 
-                goal_minute, goal_reliability = get_match_goal_minute(event_id, score_home, score_away, headers)
+                # Recupera il PRIMO gol (goal_number=1) perché la partita è 1-0 o 0-1
+                goal_minute, goal_reliability = get_match_goal_minute(event_id, score_home, score_away, headers, goal_number=1)
                 
                 # Se non riusciamo a ottenere il minuto esatto, usa stima
                 if goal_minute is None:
@@ -541,7 +576,8 @@ def process_matches():
                     "Origin": "https://www.sofascore.com"
                 }
                 
-                second_goal_minute, second_goal_reliability = get_match_goal_minute(event_id, score_home, score_away, headers)
+                # Recupera il SECONDO gol (goal_number=2) perché la partita è diventata 1-1
+                second_goal_minute, second_goal_reliability = get_match_goal_minute(event_id, score_home, score_away, headers, goal_number=2)
                 
                 # Se non riusciamo a ottenere il minuto esatto, usa minuto corrente
                 if second_goal_minute is None:
