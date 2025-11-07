@@ -118,7 +118,22 @@ def _fetch_sofascore_json(url, headers):
         )
         if prox_resp.status_code == 200:
             try:
-                return prox_resp.json()
+                import json as _json
+                wrapper = prox_resp.json()
+                # r.jina.ai restituisce un wrapper con data.content come stringa JSON
+                if isinstance(wrapper, dict) and "data" in wrapper:
+                    data_obj = wrapper.get("data", {})
+                    if isinstance(data_obj, dict) and "content" in data_obj:
+                        content_str = data_obj.get("content", "")
+                        if isinstance(content_str, str) and content_str.strip().startswith("{"):
+                            # Parse il JSON annidato
+                            try:
+                                return _json.loads(content_str)
+                            except Exception as e:
+                                print(f"[{now_utc}] ⚠️ Errore parse JSON annidato da r.jina.ai: {e}")
+                                sys.stdout.flush()
+                # Se non è il formato r.jina.ai, restituisci direttamente
+                return wrapper
             except Exception:
                 # Alcuni proxy restituiscono testo JSON valido: prova json.loads
                 import json as _json
