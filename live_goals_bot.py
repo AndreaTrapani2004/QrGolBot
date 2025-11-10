@@ -390,9 +390,17 @@ def get_match_goal_minute(event_id, score_home, score_away, headers, goal_number
                     is_home = incident.get("isHome", False)
                     is_away = incident.get("isAway", False)
                     if is_home is not None or is_away is not None:  # Gol valido
+                        # Log temporaneo per vedere tutti i campi disponibili nell'incident
+                        # (per verificare se c'è un campo per rigori)
+                        now_utc = datetime.utcnow().isoformat() + "Z"
+                        print(f"[{now_utc}] 🔍 DEBUG incident completo (type={type_id}, minute={minute}):")
+                        print(json.dumps(incident, indent=2, default=str))
+                        sys.stdout.flush()
+                        
                         goals.append({
                             "minute": minute,
                             "is_home": is_home,
+                            "is_own_goal": (type_id == 101),
                             "incident": incident
                         })
         
@@ -564,6 +572,19 @@ def process_matches():
                 if match_data.get("score") == "0-0":
                     first_score = "1-0" if score_home == 1 else "0-1"
                     period = match.get("period")  # 1 = primo tempo, 2 = secondo tempo
+                    event_id = match.get("event_id")
+                    
+                    # Chiama l'API degli incidents per vedere tutti i campi disponibili (verifica rigori/autogol)
+                    if event_id:
+                        headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            "Accept": "application/json",
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Referer": "https://www.sofascore.com/",
+                            "Origin": "https://www.sofascore.com"
+                        }
+                        # Chiama get_match_goal_minute per vedere i log degli incidents
+                        get_match_goal_minute(event_id, score_home, score_away, headers, goal_number=1)
                     
                     # Il minuto del gol è il minuto corrente (o poco prima, massimo 1 minuto)
                     goal_minute = minute if minute is not None else 0
