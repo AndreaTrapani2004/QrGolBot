@@ -8,6 +8,8 @@ Traccia partite in stato 1-0/0-1 e notifica quando diventano 1-1 entro 10 minuti
 import time
 import sys
 import json
+import tempfile
+from io import BytesIO
 import os
 import re
 import requests
@@ -390,17 +392,9 @@ def get_match_goal_minute(event_id, score_home, score_away, headers, goal_number
                     is_home = incident.get("isHome", False)
                     is_away = incident.get("isAway", False)
                     if is_home is not None or is_away is not None:  # Gol valido
-                        # Log temporaneo per vedere tutti i campi disponibili nell'incident
-                        # (per verificare se c'è un campo per rigori)
-                        now_utc = datetime.utcnow().isoformat() + "Z"
-                        print(f"[{now_utc}] 🔍 DEBUG incident completo (type={type_id}, minute={minute}):")
-                        print(json.dumps(incident, indent=2, default=str))
-                        sys.stdout.flush()
-                        
                         goals.append({
                             "minute": minute,
                             "is_home": is_home,
-                            "is_own_goal": (type_id == 101),
                             "incident": incident
                         })
         
@@ -514,6 +508,53 @@ def cleanup_expired_matches(active_matches, current_matches_dict):
 
 
 # ---------- LOGICA PRINCIPALE ----------
+def get_scores_from_incidents(event_id, headers):
+    """
+    Calcola il risultato all'intervallo (1H) e finale (2H) usando la lista incidents.
+    Torna (result_1H, result_2H) come stringhe 'H-A'. Se non disponibili, torna ('', '').
+    """
+    try:
+        if not event_id:
+            return "", ""
+        url = f"{SOFASCORE_PROXY_BASE}/event/{event_id}/incidents"
+        data = _fetch_sofascore_json(url, headers)
+        incidents = (data or {}).get("incidents") or (data or {}).get("events") or []
+        # Estrai solo gol e autogol
+        goals = []
+        for inc in incidents:
+            inc_type = inc.get("type", {})
+            type_id = inc_type.get("id") if isinstance(inc_type, dict) else inc_type
+            if type_id in [100, 101]:
+                minute = inc.get("minute")
+                if minute is None:
+                    continue
+                is_home = inc.get("isHome", False)
+                is_away = inc.get("isAway", False)
+                if is_home is None and is_away is None:
+                    continue
+                goals.append({"minute": minute, "is_home": is_home, "is_away": is_away})
+        if not goals:
+            return "", ""
+        # Ordina per minuto
+        goals.sort(key=lambda g: g["minute"])
+        # Tally
+        home_1h = away_1h = 0
+        home_ft = away_ft = 0
+        for g in goals:
+            if g["is_home"]:
+                home_ft += 1
+            elif g["is_away"]:
+                away_ft += 1
+            # Halftime: conteggia gol fino al 45'
+            if g["minute"] <= 45:
+                if g["is_home"]:
+                    home_1h += 1
+                elif g["is_away"]:
+                    away_1h += 1
+        return f"{home_1h}-{away_1h}", f"{home_ft}-{away_ft}"
+    except Exception:
+        return "", ""
+
 def process_matches():
     """Processa tutte le partite live e gestisce il tracking 1-0/0-1 → 1-1"""
     active_matches = load_active_matches()
@@ -678,6 +719,7 @@ def process_matches():
                         "away": away,
                         "league": league,
                         "country": country,
+                        "event_id": match.get("event_id"),
                         "first_score": first_score,
                         "first_minute": first_min,
                         "second_minute": second_min,
@@ -1083,6 +1125,92 @@ def cmd_stats(update, context):
     update.effective_message.reply_text("\n".join(lines))
 
 
+def cmd_excel(update, context):
+    """Genera e invia un file Excel con tutte le partite notificate"""
+    try:
+        sent_matches = load_sent_matches()
+        if not sent_matches:
+            update.effective_message.reply_text("Nessuna partita notificata finora.")
+            return
+        
+        # Prepara workbook
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            update.effective_message.reply_text("Libreria openpyxl non disponibile sul server.")
+            return
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Matches"
+        # Header
+        ws.append([
+            "home_team",
+            "away_team",
+            "country",
+            "league",
+            "result_1H",
+            "result_2H",
+            "min_1Gol",
+            "min_1-1"
+        ])
+        
+        # Headers HTTP per API
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.sofascore.com/",
+            "Origin": "https://www.sofascore.com"
+        }
+        
+        # Righe
+        for _, m in sent_matches.items():
+            if not isinstance(m, dict) or not m:
+                # Vecchio formato - salta
+                continue
+            home = m.get("home", "")
+            away = m.get("away", "")
+            country = m.get("country", "")
+            league = m.get("league", "")
+            first_min = m.get("first_minute", "")
+            second_min = m.get("second_minute", "")
+            
+            # Calcola risultati 1H e 2H se abbiamo event_id
+            event_id = m.get("event_id")
+            result_1h, result_2h = "", ""
+            if event_id:
+                r1, r2 = get_scores_from_incidents(event_id, headers)
+                result_1h, result_2h = r1, r2
+            
+            ws.append([
+                home,
+                away,
+                country,
+                league,
+                result_1h,
+                result_2h,
+                first_min,
+                second_min
+            ])
+        
+        # Salva su file temporaneo
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+            tmp_path = tmp.name
+        wb.save(tmp_path)
+        
+        # Invia file
+        with open(tmp_path, "rb") as f:
+            update.effective_message.reply_document(document=f, filename="matches.xlsx", caption="Excel generato")
+        
+        # Prova a rimuovere il file
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+    except Exception as e:
+        update.effective_message.reply_text(f"Errore generazione Excel: {e}")
+
 def setup_telegram_commands():
     """Configura e avvia Updater per comandi Telegram"""
     try:
@@ -1141,6 +1269,7 @@ def setup_telegram_commands():
         dp.add_handler(CommandHandler("interested", cmd_interested))
         dp.add_handler(CommandHandler("reported", cmd_interested))  # Alias
         dp.add_handler(CommandHandler("stats", cmd_stats))
+        dp.add_handler(CommandHandler("excel", cmd_excel))
         
         # Gestione comandi nei canali
         def handle_channel_command(update, context):
@@ -1172,6 +1301,8 @@ def setup_telegram_commands():
                 cmd_active(update, context)
             elif cmd == "stats":
                 cmd_stats(update, context)
+            elif cmd == "excel":
+                cmd_excel(update, context)
         
         dp.add_handler(MessageHandler(Filters.update.channel_posts, handle_channel_command))
         
