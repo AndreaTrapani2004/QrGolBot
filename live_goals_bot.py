@@ -819,7 +819,8 @@ def cmd_help(update, context):
         "/see_all_games - Tutte le partite trovate\n"
         "/active - Partite attualmente in tracking (1-0/0-1)\n"
         "/interested - Partite che sono state notificate (reportate)\n"
-        "/stats - Statistiche notifiche (ultimi 7 giorni)"
+        "/stats - Statistiche notifiche (ultimi 7 giorni)\n"
+        "/excel - Scarica Excel completo con risultati e minuti"
     )
     update.effective_message.reply_text(help_text)
 
