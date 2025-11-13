@@ -149,7 +149,7 @@ def _fetch_sofascore_json(url, headers):
             except Exception:
                 # Alcuni proxy restituiscono testo JSON valido: prova json.loads
                 import json as _json
-                try:
+    try:
                     return _json.loads(prox_resp.text)
                 except Exception:
                     print(f"[{now_utc}] ⚠️ Impossibile parsare JSON dal fallback, primi 200 char: {prox_resp.text[:200]!r}")
@@ -510,21 +510,91 @@ def cleanup_expired_matches(active_matches, current_matches_dict):
 # ---------- LOGICA PRINCIPALE ----------
 def get_scores_from_incidents(event_id, headers):
     """
-    Calcola il risultato all'intervallo (1H) e finale (2H) usando la lista incidents.
+    Recupera il risultato all'intervallo (1H) e finale (2H) dall'API SofaScore.
     Torna (result_1H, result_2H) come stringhe 'H-A'. Se non disponibili, torna ('', '').
     """
     try:
         if not event_id:
             return "", ""
+        
+        # Prova prima a recuperare dal dettaglio evento (più affidabile per partite finite)
+        try:
+            url = f"{SOFASCORE_PROXY_BASE}/event/{event_id}"
+            now_utc = datetime.utcnow().isoformat() + "Z"
+            print(f"[{now_utc}] 🔍 DEBUG: Chiamata API /event/{event_id} per recuperare risultati")
+            sys.stdout.flush()
+            
+            event_data = _fetch_sofascore_json(url, headers)
+            if event_data:
+                print(f"[{now_utc}] 🔍 DEBUG: Risposta API /event/{event_id} ricevuta, keys: {list(event_data.keys())}")
+                sys.stdout.flush()
+                
+                # Cerca i risultati nei periodi
+                event_obj = event_data.get("event", {})
+                periods = event_obj.get("periods", [])
+                
+                print(f"[{now_utc}] 🔍 DEBUG: Periodi trovati: {len(periods)}")
+                sys.stdout.flush()
+                
+                if periods:
+                    # Primo periodo (1H)
+                    period_1h = None
+                    # Secondo periodo (2H) o risultato finale
+                    period_2h = None
+                    
+                    for period in periods:
+                        period_num = period.get("period")
+                        print(f"[{now_utc}] 🔍 DEBUG: Periodo trovato: {period_num}, homeScore={period.get('homeScore')}, awayScore={period.get('awayScore')}")
+                        sys.stdout.flush()
+                        if period_num == 1:
+                            period_1h = period
+                        elif period_num == 2:
+                            period_2h = period
+                    
+                    # Se abbiamo i periodi, usa quelli
+                    if period_1h and period_2h:
+                        home_1h = period_1h.get("homeScore", 0)
+                        away_1h = period_1h.get("awayScore", 0)
+                        home_ft = period_2h.get("homeScore", 0)
+                        away_ft = period_2h.get("awayScore", 0)
+                        result_1h = f"{home_1h}-{away_1h}"
+                        result_2h = f"{home_ft}-{away_ft}"
+                        print(f"[{now_utc}] ✅ DEBUG: Risultati recuperati da /event: 1H={result_1h}, 2H={result_2h}")
+                        sys.stdout.flush()
+                        return result_1h, result_2h
+                    else:
+                        print(f"[{now_utc}] ⚠️ DEBUG: Periodi 1H o 2H non trovati (1H={period_1h is not None}, 2H={period_2h is not None})")
+                        sys.stdout.flush()
+                else:
+                    print(f"[{now_utc}] ⚠️ DEBUG: Nessun periodo trovato in event_data")
+                    sys.stdout.flush()
+            else:
+                print(f"[{now_utc}] ⚠️ DEBUG: event_data è None o vuoto")
+                sys.stdout.flush()
+        except Exception as e:
+            now_utc = datetime.utcnow().isoformat() + "Z"
+            print(f"[{now_utc}] ⚠️ DEBUG: Errore recupero da /event/{event_id}: {e}")
+            sys.stdout.flush()
+            pass  # Fallback agli incidents
+        
+        # Fallback: calcola dai incidents
+        now_utc = datetime.utcnow().isoformat() + "Z"
+        print(f"[{now_utc}] 🔍 DEBUG: Fallback a /incidents per event_id {event_id}")
+        sys.stdout.flush()
+        
         url = f"{SOFASCORE_PROXY_BASE}/event/{event_id}/incidents"
         data = _fetch_sofascore_json(url, headers)
         incidents = (data or {}).get("incidents") or (data or {}).get("events") or []
+        
+        print(f"[{now_utc}] 🔍 DEBUG: Incidents trovati: {len(incidents)}")
+        sys.stdout.flush()
+        
         # Estrai solo gol e autogol
         goals = []
         for inc in incidents:
             inc_type = inc.get("type", {})
             type_id = inc_type.get("id") if isinstance(inc_type, dict) else inc_type
-            if type_id in [100, 101]:
+            if type_id in [100, 101]:  # 100 = goal, 101 = own goal
                 minute = inc.get("minute")
                 if minute is None:
                     continue
@@ -533,11 +603,19 @@ def get_scores_from_incidents(event_id, headers):
                 if is_home is None and is_away is None:
                     continue
                 goals.append({"minute": minute, "is_home": is_home, "is_away": is_away})
+        
+        print(f"[{now_utc}] 🔍 DEBUG: Gol trovati negli incidents: {len(goals)}")
+        sys.stdout.flush()
+        
         if not goals:
+            print(f"[{now_utc}] ⚠️ DEBUG: Nessun gol trovato, restituisco ('', '')")
+            sys.stdout.flush()
             return "", ""
+        
         # Ordina per minuto
         goals.sort(key=lambda g: g["minute"])
-        # Tally
+        
+        # Calcola risultati
         home_1h = away_1h = 0
         home_ft = away_ft = 0
         for g in goals:
@@ -551,8 +629,18 @@ def get_scores_from_incidents(event_id, headers):
                     home_1h += 1
                 elif g["is_away"]:
                     away_1h += 1
-        return f"{home_1h}-{away_1h}", f"{home_ft}-{away_ft}"
-    except Exception:
+        
+        result_1h = f"{home_1h}-{away_1h}"
+        result_2h = f"{home_ft}-{away_ft}"
+        print(f"[{now_utc}] ✅ DEBUG: Risultati calcolati da incidents: 1H={result_1h}, 2H={result_2h}")
+        sys.stdout.flush()
+        
+        return result_1h, result_2h
+    except Exception as e:
+        # Log errore per debug
+        now_utc = datetime.utcnow().isoformat() + "Z"
+        print(f"[{now_utc}] ⚠️ Errore recupero risultati per event_id {event_id}: {e}")
+        sys.stdout.flush()
         return "", ""
 
 def process_matches():
@@ -613,19 +701,6 @@ def process_matches():
                 if match_data.get("score") == "0-0":
                     first_score = "1-0" if score_home == 1 else "0-1"
                     period = match.get("period")  # 1 = primo tempo, 2 = secondo tempo
-                    event_id = match.get("event_id")
-                    
-                    # Chiama l'API degli incidents per vedere tutti i campi disponibili (verifica rigori/autogol)
-                    if event_id:
-                        headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                            "Accept": "application/json",
-                            "Accept-Language": "en-US,en;q=0.9",
-                            "Referer": "https://www.sofascore.com/",
-                            "Origin": "https://www.sofascore.com"
-                        }
-                        # Chiama get_match_goal_minute per vedere i log degli incidents
-                        get_match_goal_minute(event_id, score_home, score_away, headers, goal_number=1)
                     
                     # Il minuto del gol è il minuto corrente (o poco prima, massimo 1 minuto)
                     goal_minute = minute if minute is not None else 0
