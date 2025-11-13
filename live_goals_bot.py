@@ -1240,8 +1240,9 @@ def cmd_excel(update, context):
             "Origin": "https://www.sofascore.com"
         }
         
-        # Righe
-        for _, m in sent_matches.items():
+        # Righe - aggiorna risultati se mancanti
+        updated = False
+        for match_id, m in sent_matches.items():
             if not isinstance(m, dict) or not m:
                 # Vecchio formato - salta
                 continue
@@ -1252,12 +1253,21 @@ def cmd_excel(update, context):
             first_min = m.get("first_minute", "")
             second_min = m.get("second_minute", "")
             
-            # Calcola risultati 1H e 2H se abbiamo event_id
-            event_id = m.get("event_id")
-            result_1h, result_2h = "", ""
-            if event_id:
-                r1, r2 = get_scores_from_incidents(event_id, headers)
-                result_1h, result_2h = r1, r2
+            # Controlla se abbiamo già i risultati salvati
+            result_1h = m.get("result_1H", "")
+            result_2h = m.get("result_2H", "")
+            
+            # Se non abbiamo i risultati, recuperali dall'API e salvali
+            if not result_1h or not result_2h:
+                event_id = m.get("event_id")
+                if event_id:
+                    r1, r2 = get_scores_from_incidents(event_id, headers)
+                    if r1 and r2:  # Solo se abbiamo recuperato i risultati
+                        result_1h, result_2h = r1, r2
+                        # Salva i risultati per la prossima volta
+                        m["result_1H"] = result_1h
+                        m["result_2H"] = result_2h
+                        updated = True
             
             ws.append([
                 home,
@@ -1269,6 +1279,10 @@ def cmd_excel(update, context):
                 first_min,
                 second_min
             ])
+        
+        # Salva i risultati aggiornati se abbiamo fatto modifiche
+        if updated:
+            save_sent_matches(sent_matches)
         
         # Salva su file temporaneo
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
