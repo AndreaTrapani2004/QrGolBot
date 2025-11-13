@@ -149,7 +149,7 @@ def _fetch_sofascore_json(url, headers):
             except Exception:
                 # Alcuni proxy restituiscono testo JSON valido: prova json.loads
                 import json as _json
-    try:
+                try:
                     return _json.loads(prox_resp.text)
                 except Exception:
                     print(f"[{now_utc}] ⚠️ Impossibile parsare JSON dal fallback, primi 200 char: {prox_resp.text[:200]!r}")
