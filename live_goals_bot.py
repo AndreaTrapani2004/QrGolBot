@@ -325,7 +325,10 @@ def scrape_sofascore():
                     "minute": minute,
                     "period": period,  # 1 = primo tempo, 2 = secondo tempo
                     "reliability": reliability,  # Attendibilità 0-5
-                    "event_id": event_id  # ID partita per recuperare eventi/gol
+                    "event_id": event_id,  # ID partita per recuperare eventi/gol
+                    "status_code": status.get("code"),
+                    "status_type": status.get("type"),
+                    "status_description": status.get("description", "")
                 })
             except Exception as e:
                 print(f"Errore nell'estrazione partita: {e}")
@@ -643,6 +646,71 @@ def get_scores_from_incidents(event_id, headers):
         sys.stdout.flush()
         return "", ""
 
+
+def update_results_for_sent_matches(sent_matches, current_matches_dict):
+    """
+    Aggiorna le partite notificate salvando i risultati 1H e 2H
+    non appena disponibili.
+    """
+    if not sent_matches:
+        return
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.sofascore.com/",
+        "Origin": "https://www.sofascore.com"
+    }
+    
+    for match_id, match_data in sent_matches.items():
+        if not isinstance(match_data, dict) or not match_data:
+            continue
+        
+        event_id = match_data.get("event_id")
+        if not event_id:
+            continue
+        
+        live_match = current_matches_dict.get(match_id)
+        minute = live_match.get("minute") if live_match else None
+        period = live_match.get("period") if live_match else None
+        status_type = (live_match.get("status_type") or "").lower() if live_match else ""
+        
+        halftime_ready = False
+        final_ready = False
+        
+        if live_match:
+            if (minute is not None and minute >= 45) or (period and period >= 2):
+                halftime_ready = True
+            if status_type in ("finished", "after overtime", "after penalty", "afterpenalties", "after overtime and penalties"):
+                final_ready = True
+            elif minute is not None and minute >= 95:
+                final_ready = True
+        else:
+            # Se la partita non è più live assumiamo che sia conclusa
+            halftime_ready = True
+            final_ready = True
+        
+        need_halftime = halftime_ready and not match_data.get("result_1H")
+        need_final = final_ready and not match_data.get("result_2H")
+        
+        if not need_halftime and not need_final:
+            continue
+        
+        r1, r2 = get_scores_from_incidents(event_id, headers)
+        
+        if need_halftime and r1:
+            match_data["result_1H"] = r1
+            now_utc = datetime.utcnow().isoformat() + "Z"
+            print(f"[{now_utc}] ✅ Risultato 1H salvato per {match_id}: {r1}")
+            sys.stdout.flush()
+        
+        if need_final and r2:
+            match_data["result_2H"] = r2
+            now_utc = datetime.utcnow().isoformat() + "Z"
+            print(f"[{now_utc}] ✅ Risultato finale salvato per {match_id}: {r2}")
+            sys.stdout.flush()
+
 def process_matches():
     """Processa tutte le partite live e gestisce il tracking 1-0/0-1 → 1-1"""
     active_matches = load_active_matches()
@@ -827,7 +895,8 @@ def process_matches():
                 del active_matches[match_id]
                 print(f"Partita rimossa dal tracking (punteggio cambiato): {home} - {away} (era {match_data.get('first_score')}, ora {score_home}-{score_away})")
     
-    # Salva stato
+    # Aggiorna risultati salvati e persisti stato
+    update_results_for_sent_matches(sent_matches, current_matches_dict)
     save_active_matches(active_matches)
     save_sent_matches(sent_matches)
 
@@ -1231,17 +1300,9 @@ def cmd_excel(update, context):
             "min_1-1"
         ])
         
-        # Headers HTTP per API
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.sofascore.com/",
-            "Origin": "https://www.sofascore.com"
-        }
-        
-        # Righe - aggiorna risultati se mancanti
-        updated = False
+        rows_written = 0
+        missing_count = 0
+        missing_examples = []
         for match_id, m in sent_matches.items():
             if not isinstance(m, dict) or not m:
                 # Vecchio formato - salta
@@ -1257,17 +1318,11 @@ def cmd_excel(update, context):
             result_1h = m.get("result_1H", "")
             result_2h = m.get("result_2H", "")
             
-            # Se non abbiamo i risultati, recuperali dall'API e salvali
             if not result_1h or not result_2h:
-                event_id = m.get("event_id")
-                if event_id:
-                    r1, r2 = get_scores_from_incidents(event_id, headers)
-                    if r1 and r2:  # Solo se abbiamo recuperato i risultati
-                        result_1h, result_2h = r1, r2
-                        # Salva i risultati per la prossima volta
-                        m["result_1H"] = result_1h
-                        m["result_2H"] = result_2h
-                        updated = True
+                missing_count += 1
+                if len(missing_examples) < 5:
+                    missing_examples.append(f"{home} - {away}")
+                continue
             
             ws.append([
                 home,
@@ -1279,10 +1334,14 @@ def cmd_excel(update, context):
                 first_min,
                 second_min
             ])
+            rows_written += 1
         
-        # Salva i risultati aggiornati se abbiamo fatto modifiche
-        if updated:
-            save_sent_matches(sent_matches)
+        if rows_written == 0:
+            msg = "Nessuna partita ha risultati completi da esportare."
+            if missing_count:
+                msg += f" In attesa di {missing_count} partite."
+            update.effective_message.reply_text(msg)
+            return
         
         # Salva su file temporaneo
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
@@ -1292,6 +1351,12 @@ def cmd_excel(update, context):
         # Invia file
         with open(tmp_path, "rb") as f:
             update.effective_message.reply_document(document=f, filename="matches.xlsx", caption="Excel generato")
+        
+        if missing_count:
+            info_msg = f"{missing_count} partite sono ancora senza risultati completi."
+            if missing_examples:
+                info_msg += " Esempi: " + ", ".join(missing_examples)
+            update.effective_message.reply_text(info_msg)
         
         # Prova a rimuovere il file
         try:

@@ -79,3 +79,4 @@ Il bot si addormenta dopo 15 minuti di inattività. Per mantenerlo sveglio:
 - Se il bot si addormenta, verifica che UptimeRobot stia facendo ping
 - Se vedi errori, controlla che le variabili d'ambiente siano corrette
 
+
