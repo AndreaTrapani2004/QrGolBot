@@ -24,7 +24,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ---------- CONFIGURAZIONE ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID"))
-POLL_INTERVAL = 60  # 1 minuto = 60 secondi
+POLL_INTERVAL = 30  # Intervallo di controllo in secondi
 SOFASCORE_API_URL = "https://api.sofascore.com/api/v1"
 # Proxy opzionale per SofaScore (es. Cloudflare Workers). Se settato, sostituisce la base URL.
 SOFASCORE_PROXY_BASE = os.getenv("SOFASCORE_PROXY_BASE", SOFASCORE_API_URL)
