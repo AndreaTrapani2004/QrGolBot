@@ -446,23 +446,27 @@ def get_match_goal_minute(event_id, score_home, score_away, headers, goal_number
         return None, 0
 
 
-def send_message(home, away, league, country, first_score, first_min, second_score, second_min, reliability=0):
+def send_message(home, away, league, country, first_score, first_min, second_score, second_min, reliability=0, event_id=None):
     """Invia messaggio Telegram con i dettagli del pattern 1-1"""
     global total_notifications_sent
     
     # Emoji per attendibilità
     reliability_emoji = ["❌", "⚠️", "⚠️", "✅", "✅", "✅✅"]
-    reliability_text = ["Nessun dato", "Basso", "Medio", "Buono", "Alto", "Massimo"]
     reliability_idx = min(reliability, 5)
+    reliability_emoji_str = reliability_emoji[reliability_idx]
 
-    header = f"{reliability_emoji[reliability_idx]} {home} - {away} ({league} - {country})"
-    reliability_str = f"Attendibilità: {reliability}/5 ({reliability_text[reliability_idx]})"
+    # Costruisci link SofaScore se event_id disponibile
+    link = ""
+    if event_id:
+        link = f"\n🔗 https://www.sofascore.com/event/{event_id}"
 
     text = (
-        f"{header}\n"
-        f"{reliability_str}\n"
-        f"{first_score} ; {first_min}'\n"
-           f"{second_score} ; {second_min}'"
+        f"⚽ GOL QR {reliability_emoji_str}\n\n"
+        f"🏠 {home}\n"
+        f"🆚 {away}\n"
+        f"📊 {league} - {country}\n"
+        f"⏱️ Minuto {first_score} ; {first_min}'\n"
+        f"⏱️ Minuto {second_score} ; {second_min}'{link}"
     )
     bot.send_message(chat_id=CHAT_ID, text=text)
     
@@ -855,7 +859,7 @@ def process_matches():
                     first_reliability = match_data.get("first_goal_reliability", 0)
                     combined_reliability = min(first_reliability, second_goal_reliability)
                     
-                    send_message(home, away, league, country, first_score, first_min, "1-1", second_min, combined_reliability)
+                    send_message(home, away, league, country, first_score, first_min, "1-1", second_min, combined_reliability, match.get("event_id"))
                     # Salva dettagli della partita notificata
                     sent_matches[match_id] = {
                         "home": home,
@@ -921,11 +925,6 @@ def cmd_start(update, context):
         "• Una partita è 1-0 o 0-1\n"
         "• Diventa 1-1 entro 10 minuti di gioco\n"
         "• Entrambi i gol sono nella stessa metà tempo\n\n"
-        "📊 Sistema di Attendibilità (0-5):\n"
-        "❌ 0: Nessun dato disponibile\n"
-        "⚠️ 1-2: Dati parziali o calcolati\n"
-        "✅ 3-4: Dati buoni/alti\n"
-        "✅✅ 5: Massima attendibilità\n\n"
         "📋 Usa /help per vedere tutti i comandi disponibili\n"
         "🔍 Usa /live per vedere le partite live rilevanti\n"
         "📊 Usa /status per lo stato del bot"
@@ -948,12 +947,6 @@ def cmd_help(update, context):
         "• Diventa 1-1 entro 10 minuti di gioco dal primo gol\n"
         "• Entrambi i gol nella stessa metà tempo (1H o 2H)\n"
         "• Squadre opposte\n\n"
-        "📊 Sistema di Attendibilità (0-5):\n"
-        "Ogni notifica include un indicatore di attendibilità:\n"
-        "❌ 0: Nessun dato minuto disponibile\n"
-        "⚠️ 1-2: Minuto calcolato ma con dati parziali\n"
-        "✅ 3-4: Minuto calcolato correttamente con periodo\n"
-        "✅✅ 5: Massima attendibilità\n\n"
         "📋 Comandi disponibili:\n"
         "/start - Messaggio di benvenuto\n"
         "/ping - Verifica se il bot è attivo\n"
