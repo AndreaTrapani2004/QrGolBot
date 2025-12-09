@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from telegram import Bot
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 from telegram.error import Conflict, NetworkError
-from threading import Thread
+from threading import Thread, Lock
 import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -36,6 +36,13 @@ bot = Bot(token=TELEGRAM_TOKEN)
 ACTIVE_MATCHES_FILE = "active_matches.json"
 # File per salvare le partite già notificate (evita duplicati)
 SENT_MATCHES_FILE = "sent_matches.json"
+# File per salvare la deadlist (partite da non controllare)
+DEADLIST_FILE = "deadlist.json"
+
+# ---------- RATE LIMITING GLOBALE ----------
+_last_api_call_time = 0
+_rate_limit_lock = Lock()
+MIN_DELAY_BETWEEN_API_CALLS = 0.2  # Secondi minimi tra chiamate API (evita rate limiting, ma non troppo aggressivo)
 
 
 # ---------- FUNZIONI UTILI ----------
@@ -93,14 +100,102 @@ def save_sent_matches(sent_dict):
         json.dump(sent_dict, f, indent=2)
 
 
+def load_deadlist():
+    """Carica la deadlist (partite da non controllare) da file"""
+    try:
+        with open(DEADLIST_FILE, "r") as f:
+            data = json.load(f)
+            # Se è una lista (vecchio formato), converti in set
+            if isinstance(data, list):
+                return set(data)
+            # Se è un dict, usa le chiavi come set
+            if isinstance(data, dict):
+                return set(data.keys())
+            return set(data) if data else set()
+    except Exception:
+        return set()
+
+
+def save_deadlist(deadlist):
+    """Salva la deadlist su file"""
+    # Salva come lista per semplicità
+    with open(DEADLIST_FILE, "w") as f:
+        json.dump(list(deadlist), f, indent=2)
+
+
+def should_be_deadlisted(match, sent_matches, active_matches):
+    """
+    Determina se una partita dovrebbe essere aggiunta alla deadlist.
+    
+    Una partita va in deadlist se:
+    1. È già stata notificata (sent_matches)
+    2. Ha un punteggio che non può diventare 1-1 (es. 2-0, 0-2, 2-1, 3-0, ecc.)
+    3. È finita
+    4. Era 1-0/0-1 ma è scaduta (>10 minuti dal primo gol)
+    """
+    match_id = get_match_id(match["home"], match["away"], match["league"])
+    score_home = match["score_home"]
+    score_away = match["score_away"]
+    status_type = (match.get("status_type") or "").lower()
+    minute = match.get("minute")
+    
+    # 1. Già notificata
+    if match_id in sent_matches:
+        return True, "già notificata"
+    
+    # 2. Finita
+    if status_type in ("finished", "after overtime", "after penalty", "afterpenalties", "after overtime and penalties"):
+        return True, "finita"
+    
+    # 3. Punteggio che non può diventare 1-1
+    # Solo questi punteggi possono diventare 1-1: 0-0, 1-0, 0-1, 1-1
+    # Tutti gli altri (2-0, 0-2, 2-1, 1-2, 3-0, ecc.) vanno in deadlist
+    if not ((score_home == 0 and score_away == 0) or 
+            (score_home == 1 and score_away == 0) or 
+            (score_home == 0 and score_away == 1) or 
+            (score_home == 1 and score_away == 1)):
+        return True, f"punteggio {score_home}-{score_away} non può diventare 1-1"
+    
+    # 4. Era 1-0/0-1 ma è scaduta (>10 minuti dal primo gol)
+    if match_id in active_matches:
+        match_data = active_matches[match_id]
+        if "first_score" in match_data:  # Era 1-0/0-1
+            first_goal_minute = match_data.get("first_goal_minute", 0)
+            if first_goal_minute > 0 and minute is not None and minute > 0:
+                elapsed = minute - first_goal_minute
+                if elapsed > 10:
+                    return True, f"scaduta ({elapsed} minuti dal primo gol)"
+    
+    return False, None
+
+
 def get_match_id(home, away, league):
     """Genera un ID univoco per una partita"""
     return f"{home}_{away}_{league}".lower().replace(" ", "_")
 
 
-def _fetch_sofascore_json(url, headers):
-    """Tenta fetch diretto; su 403 usa fallback r.jina.ai come proxy pubblico."""
+def _wait_for_rate_limit():
+    """Attende se necessario per rispettare il rate limiting globale"""
+    global _last_api_call_time
+    with _rate_limit_lock:
+        now = time.time()
+        elapsed = now - _last_api_call_time
+        if elapsed < MIN_DELAY_BETWEEN_API_CALLS:
+            sleep_time = MIN_DELAY_BETWEEN_API_CALLS - elapsed
+            time.sleep(sleep_time)
+        _last_api_call_time = time.time()
+
+
+def _fetch_sofascore_json(url, headers, max_retries=2):
+    """
+    Tenta fetch diretto; su 403 usa fallback r.jina.ai come proxy pubblico.
+    Con retry e exponential backoff per errori 429.
+    """
     now_utc = datetime.utcnow().isoformat() + "Z"
+    
+    # Rate limiting: attendi prima di fare la chiamata
+    _wait_for_rate_limit()
+    
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code == 200:
@@ -114,49 +209,82 @@ def _fetch_sofascore_json(url, headers):
             print(f"[{now_utc}] ⚠️ Errore API SofaScore: status={resp.status_code}")
             sys.stdout.flush()
             return None
+        
         # Fallback via r.jina.ai (no crediti, spesso evita blocchi IP)
         # Convertiamo https://... in http://... per l'URL interno
         inner = url.replace("https://", "http://")
         proxy_url = f"https://r.jina.ai/{inner}"
-        print(f"[{now_utc}] 🔁 Fallback via r.jina.ai: {proxy_url}")
-        sys.stdout.flush()
-        prox_resp = requests.get(
-            proxy_url,
-            headers={
-                "User-Agent": headers.get("User-Agent", "Mozilla/5.0"),
-                "Accept": "application/json",
-            },
-            timeout=20,
-        )
-        if prox_resp.status_code == 200:
-            try:
-                import json as _json
-                wrapper = prox_resp.json()
-                # r.jina.ai restituisce un wrapper con data.content come stringa JSON
-                if isinstance(wrapper, dict) and "data" in wrapper:
-                    data_obj = wrapper.get("data", {})
-                    if isinstance(data_obj, dict) and "content" in data_obj:
-                        content_str = data_obj.get("content", "")
-                        if isinstance(content_str, str) and content_str.strip().startswith("{"):
-                            # Parse il JSON annidato
-                            try:
-                                return _json.loads(content_str)
-                            except Exception as e:
-                                print(f"[{now_utc}] ⚠️ Errore parse JSON annidato da r.jina.ai: {e}")
-                                sys.stdout.flush()
-                # Se non è il formato r.jina.ai, restituisci direttamente
-                return wrapper
-            except Exception:
-                # Alcuni proxy restituiscono testo JSON valido: prova json.loads
-                import json as _json
+        
+        # Retry con exponential backoff per errori 429
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                # Exponential backoff: 1s, 2s, 4s...
+                backoff_time = 2 ** (attempt - 1)
+                now_utc = datetime.utcnow().isoformat() + "Z"
+                print(f"[{now_utc}] ⏳ Retry {attempt}/{max_retries} dopo {backoff_time}s...")
+                sys.stdout.flush()
+                time.sleep(backoff_time)
+            
+            _wait_for_rate_limit()  # Rate limiting anche per retry
+            
+            if attempt == 0:
+                print(f"[{now_utc}] 🔁 Fallback via r.jina.ai: {proxy_url}")
+                sys.stdout.flush()
+            
+            prox_resp = requests.get(
+                proxy_url,
+                headers={
+                    "User-Agent": headers.get("User-Agent", "Mozilla/5.0"),
+                    "Accept": "application/json",
+                },
+                timeout=20,
+            )
+            
+            if prox_resp.status_code == 200:
                 try:
-                    return _json.loads(prox_resp.text)
+                    import json as _json
+                    wrapper = prox_resp.json()
+                    # r.jina.ai restituisce un wrapper con data.content come stringa JSON
+                    if isinstance(wrapper, dict) and "data" in wrapper:
+                        data_obj = wrapper.get("data", {})
+                        if isinstance(data_obj, dict) and "content" in data_obj:
+                            content_str = data_obj.get("content", "")
+                            if isinstance(content_str, str) and content_str.strip().startswith("{"):
+                                # Parse il JSON annidato
+                                try:
+                                    return _json.loads(content_str)
+                                except Exception as e:
+                                    print(f"[{now_utc}] ⚠️ Errore parse JSON annidato da r.jina.ai: {e}")
+                                    sys.stdout.flush()
+                    # Se non è il formato r.jina.ai, restituisci direttamente
+                    return wrapper
                 except Exception:
-                    print(f"[{now_utc}] ⚠️ Impossibile parsare JSON dal fallback, primi 200 char: {prox_resp.text[:200]!r}")
+                    # Alcuni proxy restituiscono testo JSON valido: prova json.loads
+                    import json as _json
+                    try:
+                        return _json.loads(prox_resp.text)
+                    except Exception:
+                        print(f"[{now_utc}] ⚠️ Impossibile parsare JSON dal fallback, primi 200 char: {prox_resp.text[:200]!r}")
+                        sys.stdout.flush()
+                        return None
+            elif prox_resp.status_code == 429:
+                # Rate limited - continuerà con il retry
+                now_utc = datetime.utcnow().isoformat() + "Z"
+                print(f"[{now_utc}] ⚠️ Rate limited (429) da r.jina.ai, tentativo {attempt + 1}/{max_retries + 1}")
+                sys.stdout.flush()
+                if attempt < max_retries:
+                    continue  # Prova di nuovo
+                else:
+                    print(f"[{now_utc}] ⚠️ Fallback r.jina.ai fallito dopo {max_retries + 1} tentativi: status=429")
                     sys.stdout.flush()
                     return None
-        print(f"[{now_utc}] ⚠️ Fallback r.jina.ai fallito: status={prox_resp.status_code}")
-        sys.stdout.flush()
+            else:
+                # Altro errore
+                now_utc = datetime.utcnow().isoformat() + "Z"
+                print(f"[{now_utc}] ⚠️ Fallback r.jina.ai fallito: status={prox_resp.status_code}")
+                sys.stdout.flush()
+                return None
+        
         return None
     except Exception as e:
         print(f"[{now_utc}] ⚠️ Eccezione fetch SofaScore: {e}")
@@ -315,6 +443,42 @@ def scrape_sofascore():
                 # Estrai ID partita per recuperare eventi/gol
                 event_id = event.get("id")
                 
+                # PROVA: Verifica se l'evento contiene già i risultati per periodo
+                # (potrebbe essere disponibile nella prima chiamata senza bisogno di chiamate aggiuntive)
+                result_1h = None
+                result_2h = None
+                
+                # DEBUG: Log tutte le chiavi disponibili nell'evento (solo per la prima partita)
+                if len(matches) == 0 and event_id:
+                    now_utc = datetime.utcnow().isoformat() + "Z"
+                    event_keys = list(event.keys())
+                    print(f"[{now_utc}] 🔍 DEBUG: Chiavi disponibili nell'evento {event_id}: {event_keys}")
+                    sys.stdout.flush()
+                    # Verifica se c'è un campo periods
+                    if "periods" in event:
+                        print(f"[{now_utc}] ✅ DEBUG: Campo 'periods' trovato nell'evento!")
+                        sys.stdout.flush()
+                
+                # Cerca periods nell'evento stesso
+                periods = event.get("periods", [])
+                if periods:
+                    period_1h = None
+                    period_2h = None
+                    for p in periods:
+                        period_num = p.get("period")
+                        if period_num == 1:
+                            period_1h = p
+                        elif period_num == 2:
+                            period_2h = p
+                    
+                    if period_1h and period_2h:
+                        home_1h = period_1h.get("homeScore", 0)
+                        away_1h = period_1h.get("awayScore", 0)
+                        home_ft = period_2h.get("homeScore", 0)
+                        away_ft = period_2h.get("awayScore", 0)
+                        result_1h = f"{home_1h}-{away_1h}"
+                        result_2h = f"{home_ft}-{away_ft}"
+                
                 matches.append({
                     "home": home,
                     "away": away,
@@ -328,7 +492,9 @@ def scrape_sofascore():
                     "event_id": event_id,  # ID partita per recuperare eventi/gol
                     "status_code": status.get("code"),
                     "status_type": status.get("type"),
-                    "status_description": status.get("description", "")
+                    "status_description": status.get("description", ""),
+                    "result_1h": result_1h,  # Risultato 1H se disponibile dalla prima chiamata
+                    "result_2h": result_2h   # Risultato 2H se disponibile dalla prima chiamata
                 })
             except Exception as e:
                 print(f"Errore nell'estrazione partita: {e}")
@@ -389,17 +555,44 @@ def get_match_goal_minute(event_id, score_home, score_away, headers, goal_number
             # Type 100 = goal, 101 = own goal
             if type_id in [100, 101]:
                 minute = incident.get("minute")
-                if minute is not None:
-                    # Verifica che sia un gol valido (non un gol annullato)
-                    # I gol hanno isHome o isAway per indicare quale squadra ha segnato
-                    is_home = incident.get("isHome", False)
-                    is_away = incident.get("isAway", False)
-                    if is_home is not None or is_away is not None:  # Gol valido
-                        goals.append({
-                            "minute": minute,
-                            "is_home": is_home,
-                            "incident": incident
-                        })
+                if minute is None:
+                    continue
+                
+                # Estrai informazioni squadra (può essere isHome/isAway o team)
+                is_home = incident.get("isHome")
+                is_away = incident.get("isAway")
+                
+                # Se non trovato con isHome/isAway, prova con team
+                if is_home is None and is_away is None:
+                    team = incident.get("team", {})
+                    if isinstance(team, dict):
+                        # Controlla se è la squadra di casa
+                        if team.get("id") == incident.get("homeTeam", {}).get("id") if isinstance(incident.get("homeTeam"), dict) else False:
+                            is_home = True
+                            is_away = False
+                        elif team.get("id") == incident.get("awayTeam", {}).get("id") if isinstance(incident.get("awayTeam"), dict) else False:
+                            is_home = False
+                            is_away = True
+                
+                # Se ancora non abbiamo informazioni sulla squadra, salta
+                if is_home is None and is_away is None:
+                    continue
+                
+                # Normalizza: se uno è True, l'altro deve essere False
+                if is_home is True:
+                    is_away = False
+                elif is_away is True:
+                    is_home = False
+                elif is_home is None:
+                    is_home = False
+                elif is_away is None:
+                    is_away = False
+                
+                goals.append({
+                    "minute": minute,
+                    "is_home": bool(is_home),
+                    "incident": incident
+                })
         
         if not goals:
             now_utc = datetime.utcnow().isoformat() + "Z"
@@ -601,15 +794,46 @@ def get_scores_from_incidents(event_id, headers):
         for inc in incidents:
             inc_type = inc.get("type", {})
             type_id = inc_type.get("id") if isinstance(inc_type, dict) else inc_type
-            if type_id in [100, 101]:  # 100 = goal, 101 = own goal
+            
+            # Type 100 = goal, 101 = own goal
+            if type_id in [100, 101]:
                 minute = inc.get("minute")
                 if minute is None:
                     continue
-                is_home = inc.get("isHome", False)
-                is_away = inc.get("isAway", False)
+                
+                # Estrai informazioni squadra (può essere isHome/isAway o team)
+                is_home = inc.get("isHome")
+                is_away = inc.get("isAway")
+                
+                # Se non trovato con isHome/isAway, prova con team
                 if is_home is None and is_away is None:
+                    team = inc.get("team", {})
+                    if isinstance(team, dict):
+                        # Controlla se è la squadra di casa
+                        if team.get("id") == inc.get("homeTeam", {}).get("id") if isinstance(inc.get("homeTeam"), dict) else False:
+                            is_home = True
+                            is_away = False
+                        elif team.get("id") == inc.get("awayTeam", {}).get("id") if isinstance(inc.get("awayTeam"), dict) else False:
+                            is_home = False
+                            is_away = True
+                
+                # Se ancora non abbiamo informazioni sulla squadra, prova a dedurlo dal tipo
+                if is_home is None and is_away is None:
+                    # Se non possiamo determinare la squadra, salta questo gol
+                    # (potrebbe essere un gol annullato o un errore nei dati)
                     continue
-                goals.append({"minute": minute, "is_home": is_home, "is_away": is_away})
+                
+                # Normalizza: se uno è True, l'altro deve essere False
+                if is_home is True:
+                    is_away = False
+                elif is_away is True:
+                    is_home = False
+                elif is_home is None:
+                    is_home = False
+                elif is_away is None:
+                    is_away = False
+                
+                goals.append({"minute": minute, "is_home": bool(is_home), "is_away": bool(is_away)})
         
         print(f"[{now_utc}] 🔍 DEBUG: Gol trovati negli incidents: {len(goals)}")
         sys.stdout.flush()
@@ -651,10 +875,15 @@ def get_scores_from_incidents(event_id, headers):
         return "", ""
 
 
-def update_results_for_sent_matches(sent_matches, current_matches_dict):
+def update_results_for_sent_matches(sent_matches, current_matches_dict, max_per_cycle=None):
     """
     Aggiorna le partite notificate salvando i risultati 1H e 2H
     non appena disponibili.
+    
+    Args:
+        sent_matches: Dict delle partite già notificate
+        current_matches_dict: Dict delle partite live attuali
+        max_per_cycle: Numero massimo di partite da processare per ciclo (None = tutte)
     """
     if not sent_matches:
         return
@@ -667,6 +896,8 @@ def update_results_for_sent_matches(sent_matches, current_matches_dict):
         "Origin": "https://www.sofascore.com"
     }
     
+    # Filtra solo le partite che hanno bisogno di aggiornamento
+    matches_to_update = []
     for match_id, match_data in sent_matches.items():
         if not isinstance(match_data, dict) or not match_data:
             continue
@@ -698,10 +929,47 @@ def update_results_for_sent_matches(sent_matches, current_matches_dict):
         need_halftime = halftime_ready and not match_data.get("result_1H")
         need_final = final_ready and not match_data.get("result_2H")
         
-        if not need_halftime and not need_final:
-            continue
+        if need_halftime or need_final:
+            matches_to_update.append((match_id, match_data, live_match, need_halftime, need_final))
+    
+    # Limita il numero di partite processate per ciclo (solo se max_per_cycle è specificato)
+    if max_per_cycle is not None and len(matches_to_update) > max_per_cycle:
+        now_utc = datetime.utcnow().isoformat() + "Z"
+        print(f"[{now_utc}] ⚡ Limite update_results: processando {max_per_cycle} su {len(matches_to_update)} partite che necessitano aggiornamento")
+        sys.stdout.flush()
+        matches_to_update = matches_to_update[:max_per_cycle]
+    
+    for match_id, match_data, live_match, need_halftime, need_final in matches_to_update:
+        event_id = match_data.get("event_id")
         
-        r1, r2 = get_scores_from_incidents(event_id, headers)
+        # OTTIMIZZAZIONE: Prima controlla se i risultati sono già disponibili dalla prima chiamata API
+        r1 = None
+        r2 = None
+        
+        if live_match:
+            # Se la partita è ancora live, controlla se abbiamo già i risultati dalla prima chiamata
+            if need_halftime and live_match.get("result_1h"):
+                r1 = live_match.get("result_1h")
+                now_utc = datetime.utcnow().isoformat() + "Z"
+                print(f"[{now_utc}] ✅ Risultato 1H recuperato dalla prima chiamata per {match_id}: {r1}")
+                sys.stdout.flush()
+            
+            if need_final and live_match.get("result_2h"):
+                r2 = live_match.get("result_2h")
+                now_utc = datetime.utcnow().isoformat() + "Z"
+                print(f"[{now_utc}] ✅ Risultato 2H recuperato dalla prima chiamata per {match_id}: {r2}")
+                sys.stdout.flush()
+        
+        # Solo se non disponibili dalla prima chiamata, fai chiamata API aggiuntiva
+        if (need_halftime and not r1) or (need_final and not r2):
+            now_utc = datetime.utcnow().isoformat() + "Z"
+            print(f"[{now_utc}] 🔍 Risultati non disponibili dalla prima chiamata, faccio chiamata API aggiuntiva per {match_id}")
+            sys.stdout.flush()
+            api_r1, api_r2 = get_scores_from_incidents(event_id, headers)
+            if need_halftime and not r1:
+                r1 = api_r1
+            if need_final and not r2:
+                r2 = api_r2
         
         if need_halftime and r1:
             match_data["result_1H"] = r1
@@ -719,22 +987,58 @@ def process_matches():
     """Processa tutte le partite live e gestisce il tracking 1-0/0-1 → 1-1"""
     active_matches = load_active_matches()
     sent_matches = load_sent_matches()  # Ora è un dict, non un set
+    deadlist = load_deadlist()  # Carica deadlist
     
     # Scraping partite live
     print("Scraping SofaScore...")
     live_matches = scrape_sofascore()
-    print(f"Trovate {len(live_matches)} partite live")
+    now_utc = datetime.utcnow().isoformat() + "Z"
+    print(f"[{now_utc}] ✅ Trovate {len(live_matches)} partite live totali dalla API")
+    sys.stdout.flush()
     
     # Crea dizionario per lookup veloce delle partite live
     current_matches_dict = {}
+    live_match_ids = set()
     for match in live_matches:
         match_id = get_match_id(match["home"], match["away"], match["league"])
         current_matches_dict[match_id] = match
+        live_match_ids.add(match_id)
+    
+    # Aggiorna deadlist: aggiungi partite che devono essere deadlisted
+    new_deadlisted = 0
+    for match in live_matches:
+        match_id = get_match_id(match["home"], match["away"], match["league"])
+        if match_id not in deadlist:
+            should_deadlist, reason = should_be_deadlisted(match, sent_matches, active_matches)
+            if should_deadlist:
+                deadlist.add(match_id)
+                new_deadlisted += 1
+                now_utc = datetime.utcnow().isoformat() + "Z"
+                print(f"[{now_utc}] 🚫 Partita aggiunta alla deadlist: {match['home']} - {match['away']} ({match['score_home']}-{match['score_away']}) - motivo: {reason}")
+                sys.stdout.flush()
+    
+    # Pulisci deadlist: rimuovi partite che non sono più live (potrebbero essere finite o non più disponibili)
+    removed_from_deadlist = 0
+    deadlist_copy = deadlist.copy()
+    for match_id in deadlist_copy:
+        if match_id not in live_match_ids:
+            # Mantieni in deadlist solo se è già stata notificata (non rimuoverla mai)
+            if match_id not in sent_matches:
+                deadlist.discard(match_id)
+                removed_from_deadlist += 1
+    
+    if new_deadlisted > 0 or removed_from_deadlist > 0:
+        now_utc = datetime.utcnow().isoformat() + "Z"
+        print(f"[{now_utc}] 📊 Deadlist aggiornata: +{new_deadlisted} nuove, -{removed_from_deadlist} rimosse, totale: {len(deadlist)}")
+        sys.stdout.flush()
     
     # Rimuovi partite scadute (>10 minuti di gioco)
     active_matches = cleanup_expired_matches(active_matches, current_matches_dict)
     
     now = datetime.now()
+    
+    # Conta quante partite vengono saltate per deadlist
+    skipped_deadlist = 0
     
     for match in live_matches:
         home = match["home"]
@@ -747,8 +1051,14 @@ def process_matches():
         
         match_id = get_match_id(home, away, league)
         
-        # Se la partita è già stata notificata, salta
+        # OTTIMIZZAZIONE: Se la partita è in deadlist, salta completamente
+        if match_id in deadlist:
+            skipped_deadlist += 1
+            continue
+        
+        # Se la partita è già stata notificata, salta (e aggiungi a deadlist)
         if match_id in sent_matches:
+            deadlist.add(match_id)
             continue
         
         # CASO 0: Traccia partite 0-0 per rilevare quando diventano 1-0/0-1
@@ -839,6 +1149,7 @@ def process_matches():
                 if not same_period:
                     # Gol in metà tempo diverse, non notificare
                     del active_matches[match_id]
+                    deadlist.add(match_id)  # Aggiungi a deadlist perché non può più essere tracciata
                     print(f"Partita scartata (gol in metà tempo diverse): {home} - {away} ({first_score} al {first_min}' → 1-1 al {second_min}')")
                     continue
                 
@@ -851,6 +1162,7 @@ def process_matches():
                     print(f"[{now_utc}] ⚠️ Notifica NON inviata: {home} - {away} ({first_score} → 1-1) - minuti non disponibili (first_min={first_min}, second_min={second_min})")
                     sys.stdout.flush()
                     del active_matches[match_id]
+                    deadlist.add(match_id)  # Aggiungi a deadlist
                     continue
                 
                 # Se è diventata 1-1 entro 10 minuti di gioco E stessa metà tempo, invia notifica
@@ -874,35 +1186,48 @@ def process_matches():
                         "notified_at": now.isoformat()
                     }
                     del active_matches[match_id]
+                    deadlist.add(match_id)  # Aggiungi a deadlist perché già notificata
                     # Entrambi i minuti sono esatti perché rilevati al momento (0-0 → 1-0/0-1 e 1-0/0-1 → 1-1)
                     now_utc = datetime.utcnow().isoformat() + "Z"
                     print(f"[{now_utc}] ✅ Notifica inviata: {home} - {away} ({first_score} al {first_min}' [ESATTO] → 1-1 al {second_min}' [ESATTO]) - {elapsed_game_minutes:.1f} min di gioco (stessa metà tempo, attendibilità {combined_reliability}/5)")
                     sys.stdout.flush()
                 else:
-                    # Scaduta, rimuovi dal tracking
+                    # Scaduta, rimuovi dal tracking e aggiungi a deadlist
                     del active_matches[match_id]
+                    deadlist.add(match_id)  # Aggiungi a deadlist perché scaduta
                     print(f"Partita scaduta (>{elapsed_game_minutes:.1f} min di gioco): {home} - {away}")
         
         # CASO 3: Partita tracciata che cambia punteggio in modo non interessante
         elif match_id in active_matches:
             match_data = active_matches[match_id]
-            # Se era 0-0 e ora non è più 0-0 e non è 1-0/0-1, rimuovila
+            # Se era 0-0 e ora non è più 0-0 e non è 1-0/0-1, rimuovila e aggiungi a deadlist
             if match_data.get("score") == "0-0":
                 # Era 0-0, ora è cambiata ma non è 1-0/0-1 (es. 2-0, 0-2, 1-1, ecc.)
                 del active_matches[match_id]
+                # Se non è 1-1 (che viene gestito nel CASO 2), aggiungi a deadlist
+                if not (score_home == 1 and score_away == 1):
+                    deadlist.add(match_id)
                 now_utc = datetime.utcnow().isoformat() + "Z"
                 print(f"[{now_utc}] ⚠️ Partita rimossa dal tracking: {home} - {away} (era 0-0, ora {score_home}-{score_away})")
                 sys.stdout.flush()
-            # Se era 1-0/0-1 e ora non è più 1-0/0-1 e non è 1-1, rimuovila
+            # Se era 1-0/0-1 e ora non è più 1-0/0-1 e non è 1-1, rimuovila e aggiungi a deadlist
             elif "first_score" in match_data:
                 # Era 1-0/0-1, ora è cambiata ma non è 1-1 (es. 2-0, 0-2, 2-1, ecc.)
                 del active_matches[match_id]
+                deadlist.add(match_id)  # Aggiungi a deadlist perché non può più diventare 1-1
                 print(f"Partita rimossa dal tracking (punteggio cambiato): {home} - {away} (era {match_data.get('first_score')}, ora {score_home}-{score_away})")
+    
+    # Log statistiche finali
+    processed_count = len(live_matches) - skipped_deadlist
+    now_utc = datetime.utcnow().isoformat() + "Z"
+    print(f"[{now_utc}] 📊 Statistiche ciclo: {len(live_matches)} partite ottenute, {processed_count} processate, {skipped_deadlist} saltate (deadlist)")
+    sys.stdout.flush()
     
     # Aggiorna risultati salvati e persisti stato
     update_results_for_sent_matches(sent_matches, current_matches_dict)
     save_active_matches(active_matches)
     save_sent_matches(sent_matches)
+    save_deadlist(deadlist)  # Salva deadlist
 
 
 # ---------- STATO RUNTIME PER COMANDI ----------
